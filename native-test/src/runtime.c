@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include <stdbool.h>
 
 enum {
     GB_FLAG_Z = 0x80,
@@ -16,10 +17,14 @@ volatile uint24_t gb_bc;
 volatile uint16_t gb_sp;
 volatile uint8_t gb_a;
 volatile uint8_t gb_f;
+volatile uint8_t gb_ime;
 uint8_t gb_wram[GB_WRAM_SIZE];
 uint8_t gb_hram[GB_HRAM_SIZE];
 uint8_t gb_lcdc;
 uint8_t gb_ly;
+uint8_t gb_stat;
+uint8_t gb_scx;
+uint8_t gb_scy;
 uint8_t gb_ie;
 uint8_t gb_if;
 
@@ -32,24 +37,35 @@ void gb_cp_a(uint8_t value)
            (a < value ? GB_FLAG_C : 0);
 }
 
+static uint8_t step_byte(uint8_t value, bool decrement)
+{
+    uint8_t result = decrement ? value - 1 : value + 1;
+    gb_f = (gb_f & GB_FLAG_C) |
+           (decrement ? GB_FLAG_N : 0) |
+           (result == 0 ? GB_FLAG_Z : 0) |
+           ((value & 0x0f) == (decrement ? 0 : 0x0f) ? GB_FLAG_H : 0);
+    return result;
+}
+
 void gb_inc_a(void)
 {
-    uint8_t old_a = gb_a;
-    uint8_t result = old_a + 1;
-    gb_a = result;
-    gb_f = (gb_f & GB_FLAG_C) |
-           (result == 0 ? GB_FLAG_Z : 0) |
-           ((old_a & 0x0f) == 0x0f ? GB_FLAG_H : 0);
+    gb_a = step_byte(gb_a, false);
+}
+
+void gb_dec_b(void)
+{
+    uint8_t result = step_byte((uint8_t)(gb_bc >> 8), true);
+    gb_bc = ((uint16_t)result << 8) | (gb_bc & 0xff);
+}
+
+void gb_inc_c(void)
+{
+    gb_bc = (gb_bc & 0xff00) | step_byte((uint8_t)gb_bc, false);
 }
 
 void gb_dec_c(void)
 {
-    uint8_t old_c = (uint8_t)gb_bc;
-    uint8_t result = old_c - 1;
-    gb_bc = (gb_bc & 0xff00) | result;
-    gb_f = (gb_f & GB_FLAG_C) | GB_FLAG_N |
-           (result == 0 ? GB_FLAG_Z : 0) |
-           ((old_c & 0x0f) == 0 ? GB_FLAG_H : 0);
+    gb_bc = (gb_bc & 0xff00) | step_byte((uint8_t)gb_bc, true);
 }
 
 uint8_t gb_read_high(uint8_t offset)
@@ -59,6 +75,12 @@ uint8_t gb_read_high(uint8_t offset)
         return gb_if | 0xe0;
     case 0x40:
         return gb_lcdc;
+    case 0x41:
+        return gb_stat | 0x80;
+    case 0x42:
+        return gb_scy;
+    case 0x43:
+        return gb_scx;
     case 0x44: {
         uint8_t line = gb_ly;
         /* Advance on polls until the runtime has a cycle-based LCD clock. */
@@ -78,7 +100,7 @@ uint8_t gb_read_high(uint8_t offset)
     }
 }
 
-void gb_write_high(uint8_t offset)
+uint8_t gb_write_high(uint8_t offset)
 {
     uint8_t value = gb_a;
     switch (offset) {
@@ -91,6 +113,15 @@ void gb_write_high(uint8_t offset)
             gb_ly = 0;
         }
         break;
+    case 0x41:
+        gb_stat = value & 0x78;
+        break;
+    case 0x42:
+        gb_scy = value;
+        break;
+    case 0x43:
+        gb_scx = value;
+        break;
     case 0x44:
         break; /* LY is read-only. */
     case 0xff:
@@ -100,9 +131,10 @@ void gb_write_high(uint8_t offset)
         if (offset >= 0x80) {
             gb_hram[offset - 0x80] = value;
         } else {
-            gb_unmapped();
+            return 0;
         }
     }
+    return 1;
 }
 
 uint8_t gb_store_a(uint24_t address)
@@ -110,7 +142,7 @@ uint8_t gb_store_a(uint24_t address)
     if (address >= GB_WRAM_BASE && address < GB_WRAM_BASE + GB_WRAM_SIZE) {
         gb_wram[address - GB_WRAM_BASE] = gb_a;
     } else if (address >= GB_HRAM_BASE && address <= 0xffff) {
-        gb_write_high((uint8_t)address);
+        return gb_write_high((uint8_t)address);
     } else if (gb_mbc5 && address >= 0x2000 && address < 0x4000) {
         uint16_t bank = gb_rom_bank;
         if (address < 0x3000) {

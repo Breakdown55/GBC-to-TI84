@@ -89,6 +89,8 @@ def main():
     parser.add_argument("--name", default="GBCRUN", help="calculator program name")
     parser.add_argument("--entry", type=parse_entry, action="append", default=[],
                         help="additional hexadecimal BANK:ADDRESS entry for dynamic targets")
+    parser.add_argument("--stop-at", type=parse_entry,
+                        help="stop before executing this hexadecimal BANK:ADDRESS")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal WRAM or HRAM address to display after execution")
     args = parser.parse_args()
@@ -100,7 +102,7 @@ def main():
     if args.watch == 0:
         parser.error("--watch must be a WRAM or HRAM address")
     try:
-        assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0)
+        assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:

@@ -9,15 +9,17 @@ from translate import dispatch, lower_instruction
 
 BANK_SIZE = 0x4000
 ENTRY = 0x0100
+CHECKPOINT = -1
 
 IMPLIED = {
-    0x00: "nop", 0x0d: "dec c", 0x22: "ld [hl+], a", 0x3c: "inc a",
+    0x00: "nop", 0x05: "dec b", 0x0c: "inc c", 0x0d: "dec c",
+    0x22: "ld [hl+], a", 0x3c: "inc a",
     0x76: "halt", 0xa7: "and a", 0xaf: "xor a", 0xb7: "or a",
     0xc1: "pop bc", 0xc5: "push bc", 0xc9: "ret",
-    0xe1: "pop hl", 0xe5: "push hl", 0xe9: "jp hl",
+    0xe1: "pop hl", 0xe2: "ldh [c], a", 0xe5: "push hl", 0xe9: "jp hl", 0xf3: "di",
 }
 BYTE_OPERAND = {
-    0x0e: "ld c, ${:02x}", 0x3e: "ld a, ${:02x}",
+    0x06: "ld b, ${:02x}", 0x0e: "ld c, ${:02x}", 0x3e: "ld a, ${:02x}",
     0xe0: "ldh [$ff{:02x}], a", 0xe6: "and ${:02x}", 0xee: "xor ${:02x}",
     0xf0: "ldh a, [$ff{:02x}]", 0xf6: "or ${:02x}", 0xfe: "cp ${:02x}",
 }
@@ -44,6 +46,9 @@ class State:
     hl: Optional[int] = None
     stack: tuple = ()
     sp: Optional[int] = None
+    b: Optional[int] = None
+    c: Optional[int] = None
+    z: Optional[bool] = None
 
 
 class Cartridge:
@@ -121,6 +126,7 @@ class Cartridge:
         next_pc = state.pc + instruction.size
         next_state = replace(state, pc=next_pc)
         a, hl, stack, sp = state.a, state.hl, state.stack, state.sp
+        b, c, z = state.b, state.c, state.z
 
         if opcode == 0x76:
             return
@@ -141,7 +147,12 @@ class Cartridge:
             yield replace(next_state, pc=value)
             return
         if opcode in (0x20, 0x28):
-            yield replace(next_state, pc=value)
+            taken_when = opcode == 0x28
+            if z is None or z == taken_when:
+                yield replace(next_state, pc=value)
+            if z is None or z != taken_when:
+                yield next_state
+            return
 
         if opcode == 0x3e:
             a = value
@@ -161,10 +172,31 @@ class Cartridge:
             elif opcode == 0xcb and value >= 0x80:
                 a &= ~(1 << ((value >> 3) & 7))
 
+        if opcode in (0x3c, 0xa7, 0xaf, 0xb7, 0xe6, 0xee, 0xf6):
+            z = None if a is None else a == 0
+        elif opcode == 0xfe:
+            z = None if a is None else a == value
+        elif opcode == 0xcb and value < 0x80:
+            z = None if a is None else not (a & (1 << ((value >> 3) & 7)))
+        elif opcode == 0x06:
+            b = value
+        elif opcode == 0x0e:
+            c = value
+        elif opcode == 0x05:
+            b = None if b is None else (b - 1) & 0xff
+            z = None if b is None else b == 0
+        elif opcode in (0x0c, 0x0d):
+            c = None if c is None else (c + (1 if opcode == 0x0c else -1)) & 0xff
+            z = None if c is None else c == 0
+
         banks = (state.bank,)
         if opcode == 0xea:
             banks = self.banks_after_store(state.bank, value, a)
             stack = self.stack_after_store(stack, sp, value, a)
+        elif opcode == 0xe0:
+            stack = self.stack_after_store(stack, sp, 0xff00 | value, a)
+        elif opcode == 0xe2:
+            stack = self.stack_after_store(stack, sp, None if c is None else 0xff00 | c, a)
         elif opcode == 0x22:
             banks = self.banks_after_store(state.bank, hl, a)
             stack = self.stack_after_store(stack, sp, hl, a)
@@ -174,19 +206,27 @@ class Cartridge:
         elif opcode == 0x31:
             stack, sp = (), value
         elif opcode in (0xc5, 0xe5):
-            stack = (*stack, hl if opcode == 0xe5 else None)
+            bc = None if b is None or c is None else (b << 8) | c
+            stack = (*stack, hl if opcode == 0xe5 else bc)
             sp = None if sp is None else (sp - 2) & 0xffff
         elif opcode in (0xc1, 0xe1):
+            word = stack[-1] if stack else None
             if opcode == 0xe1:
-                hl = stack[-1] if stack else None
+                hl = word
+            else:
+                b, c = (None, None) if word is None else (word >> 8, word & 0xff)
             stack = stack[:-1]
             sp = None if sp is None else (sp + 2) & 0xffff
         for bank in sorted(banks):
-            yield State(next_pc, bank, a, hl, stack, sp)
+            yield State(next_pc, bank, a, hl, stack, sp, b, c, z)
 
-    def discover(self, extra_entries=()):
+    def discover(self, extra_entries=(), stop_at=None):
         entry_a = 0x11 if self.cgb else 0x01
         work = deque([State(ENTRY, 1, entry_a, sp=0xfffe)])
+        if stop_at is not None:
+            bank, pc = stop_at
+            if not 0 <= bank <= self.bank_mask or not 0 <= pc < 0x8000 or (pc < BANK_SIZE and bank):
+                raise ValueError("checkpoint is outside cartridge ROM")
         for bank, pc in extra_entries:
             if not 0 <= bank <= self.bank_mask or not 0 <= pc < 0x8000:
                 raise ValueError("extra entry is outside cartridge ROM")
@@ -207,6 +247,11 @@ class Cartridge:
                 if not 0 <= state.pc < 0x8000:
                     raise ValueError("control transfer outside cartridge ROM")
                 key = bank, state.pc
+                if key == stop_at:
+                    if occupied.setdefault(key, state.pc) != state.pc:
+                        raise ValueError("checkpoint is inside an instruction")
+                    instructions[key] = Instruction(CHECKPOINT, 0, "")
+                    continue
                 if key not in instructions:
                     instruction = self.decode(bank, state.pc)
                     lower_instruction(instruction.text, state.pc)
@@ -218,6 +263,8 @@ class Cartridge:
                 work.extend(self.successors(state, instructions[key]))
             except ValueError as error:
                 raise ValueError(f"{location}: {error}") from error
+        if stop_at is not None and stop_at not in instructions:
+            raise ValueError(f"checkpoint ${stop_at[0]:03X}:${stop_at[1]:04X} is unreachable")
         return instructions
 
 
@@ -225,11 +272,11 @@ def symbol(bank, pc):
     return f"gb_{bank:03x}_{pc:04x}"
 
 
-def compile_rom(data, extra_entries=(), watch_address=0):
+def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None):
     if watch_address and not (0xc000 <= watch_address < 0xd000 or 0xff80 <= watch_address <= 0xfffe):
         raise ValueError("watch address must be in fixed WRAM or HRAM")
     cartridge = Cartridge(data)
-    instructions = cartridge.discover(extra_entries)
+    instructions = cartridge.discover(extra_entries, stop_at)
     assembly = ["    .assume ADL=1", "    .section .text"]
     targets = ['#include "runtime.h"', ""]
     entries = []
@@ -238,8 +285,11 @@ def compile_rom(data, extra_entries=(), watch_address=0):
         targets.append(f"extern void {name}(void);")
         entries.append(f"    {{0x{bank:03x}, 0x{pc:04x}, {name}}},")
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
-        if instruction.opcode in (0x22, 0x76, 0xc1, 0xc5, 0xc9, 0xcd, 0xe1, 0xe5, 0xea):
+        if instruction.opcode in (CHECKPOINT, 0x22, 0x76, 0xc1, 0xc5, 0xc9, 0xcd, 0xe0, 0xe1, 0xe2, 0xe5, 0xea):
             assembly.extend([f"    ld hl, 0x{pc:04x}", "    ld (_gb_pc), hl"])
+        if instruction.opcode == CHECKPOINT:
+            assembly.append("    jp _gb_checkpoint")
+            continue
         native, size = lower_instruction(instruction.text, pc)
         assembly.extend(f"    {line}" for line in native)
         if size is not None:

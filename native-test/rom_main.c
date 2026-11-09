@@ -3,7 +3,7 @@
 
 #include <ti/getcsc.h>
 
-enum { RUN_HALTED = 1, RUN_FAULT, RUN_MISSING_TARGET };
+enum { RUN_HALTED = 1, RUN_FAULT, RUN_MISSING_TARGET, RUN_CHECKPOINT };
 
 extern const uint16_t rom_bank_mask;
 extern const uint16_t rom_watch_address;
@@ -28,6 +28,11 @@ void gb_missing_target(void)
     gb_run_status = RUN_MISSING_TARGET;
 }
 
+void gb_checkpoint(void)
+{
+    gb_run_status = RUN_CHECKPOINT;
+}
+
 int main(void)
 {
     os_ClrHome();
@@ -43,7 +48,11 @@ int main(void)
     if (gb_run_status == RUN_HALTED) {
         os_PutStrFull("HALT");
     } else {
-        os_PutStrFull(gb_run_status == RUN_MISSING_TARGET ? "MISSING TARGET " : "FAULT ");
+        if (gb_run_status == RUN_CHECKPOINT) {
+            os_PutStrFull("CHECKPOINT ");
+        } else {
+            os_PutStrFull(gb_run_status == RUN_MISSING_TARGET ? "MISSING TARGET " : "FAULT ");
+        }
         show_hex(gb_pc < 0x4000 ? 0 : gb_rom_bank, 3);
         os_PutStrFull(":");
         show_hex(gb_pc, 4);
@@ -62,5 +71,5 @@ int main(void)
     os_PutStrFull("Press a key");
     while (!os_GetCSC()) {
     }
-    return gb_run_status == RUN_HALTED ? 0 : 1;
+    return gb_run_status == RUN_HALTED || gb_run_status == RUN_CHECKPOINT ? 0 : 1;
 }

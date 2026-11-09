@@ -6,7 +6,11 @@ import re
 
 
 ADDRESS_LABEL = r"(?:gb|jump|call|jr)_[0-9a-f]{3}_([0-9a-f]{4})"
-HIGH_REGISTERS = {"rlcdc": 0xff40, "rly": 0xff44, "rif": 0xff0f, "rie": 0xffff}
+HIGH_REGISTERS = {
+    "rif": 0xff0f, "rlcdc": 0xff40, "rstat": 0xff41, "rscy": 0xff42,
+    "rscx": 0xff43, "rly": 0xff44, "rie": 0xffff,
+}
+BYTE_STEPS = {("inc", "a"), ("inc", "c"), ("dec", "b"), ("dec", "c")}
 
 
 def operand_address(operand):
@@ -54,10 +58,10 @@ def lower_instruction(instruction, pc=None):
             "1:",
             "ld (_gb_f), a",
         ], 2 if immediate else 1
-    if parts == ["inc", "a"]:
-        return ["call _gb_inc_a"], 1
-    if parts == ["dec", "c"]:
-        return ["call _gb_dec_c"], 1
+    if parts == ["di"]:
+        return ["ld a, 0", "ld (_gb_ime), a"], 1
+    if tuple(parts) in BYTE_STEPS:
+        return [f"call _gb_{parts[0]}_{parts[1]}"], 1
     bit_op = re.fullmatch(r"(bit|res)\s+([0-7])\s*,\s*a", normalized)
     if bit_op:
         operation, bit = bit_op.groups()
@@ -74,12 +78,12 @@ def lower_instruction(instruction, pc=None):
         if immediate:
             value = int(immediate.group(1), 16)
             return call_with_arg("gb_cp_a", value), 2
-    load = re.fullmatch(r"ld\s+(a|c|hl|sp)\s*,\s*\$([0-9a-f]{1,4})", normalized)
+    load = re.fullmatch(r"ld\s+(a|b|c|hl|sp)\s*,\s*\$([0-9a-f]{1,4})", normalized)
     if load:
         register, digits = load.groups()
         value = int(digits, 16)
-        if register in ("a", "c") and len(digits) <= 2:
-            symbol = "_gb_a" if register == "a" else "_gb_bc"
+        if register in ("a", "b", "c") and len(digits) <= 2:
+            symbol = {"a": "_gb_a", "b": "_gb_bc+1", "c": "_gb_bc"}[register]
             return [f"ld a, 0x{value:02x}", f"ld ({symbol}), a"], 2
         if register == "hl":
             return [f"ld hl, 0x{value:04x}", "ld (_gb_hl), hl"], 3
@@ -100,9 +104,16 @@ def lower_instruction(instruction, pc=None):
         ], 3
     store = re.fullmatch(r"ldh\s+\[([^\]]+)\]\s*,\s*a", normalized)
     if store:
-        address = high_address(store.group(1))
+        operand = store.group(1)
+        if operand == "c":
+            return [
+                "ld hl, 0", "ld a, (_gb_bc)", "ld l, a", "push hl",
+                "call _gb_write_high", "pop bc", "or a, a", "jp z, _gb_unmapped",
+            ], 1
+        address = high_address(operand)
         if address is not None:
-            return call_with_arg("gb_write_high", address & 0xff), 2
+            return [*call_with_arg("gb_write_high", address & 0xff),
+                    "or a, a", "jp z, _gb_unmapped"], 2
     read = re.fullmatch(r"ldh\s+a\s*,\s*\[([^\]]+)\]", normalized)
     if read:
         address = high_address(read.group(1))

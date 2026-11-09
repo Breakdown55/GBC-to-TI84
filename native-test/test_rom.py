@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import unittest
 
-from rom import BANK_SIZE, Cartridge, compile_rom
+from rom import BANK_SIZE, CHECKPOINT, Cartridge, compile_rom
 
 
 def cartridge_image():
@@ -51,7 +51,7 @@ class RomTest(unittest.TestCase):
     def test_reachable_code_and_banks(self):
         data = synthetic_rom()
         instructions = Cartridge(data).discover()
-        self.assertIn((0, 0x168), instructions)  # Conditional failure path.
+        self.assertNotIn((0, 0x168), instructions)  # Known untaken branch.
         self.assertIn((0, 0x15b), instructions)  # CALL continuation.
         self.assertIn((1, 0x4000), instructions)
         self.assertIn((2, 0x4000), instructions)
@@ -61,6 +61,28 @@ class RomTest(unittest.TestCase):
         self.assertIn("jp _gb_call", assembly)
         self.assertIn("{0x002, 0x4000, gb_002_4000}", targets)
         self.assertIn("rom_watch_address = 0xc123", targets)
+
+    def test_unknown_zero_flag_keeps_both_branches(self):
+        data = cartridge_image()
+        data[0x100:0x107] = bytes.fromhex("f0 80 b7 20 01 76 76")
+        instructions = Cartridge(data).discover()
+        self.assertIn((0, 0x105), instructions)
+        self.assertIn((0, 0x106), instructions)
+
+    def test_counted_loop_stops_before_checkpoint_instruction(self):
+        data = cartridge_image()
+        data[0x100:0x10b] = bytes.fromhex("f3 af 0e 80 06 04 e2 0c 05 20 fb")
+        instructions = Cartridge(data).discover(stop_at=(0, 0x10b))
+        self.assertEqual(instructions[0, 0x10b].opcode, CHECKPOINT)
+        self.assertNotIn((0, 0x10c), instructions)
+        assembly, _ = compile_rom(data, stop_at=(0, 0x10b))
+        self.assertIn("jp _gb_checkpoint", assembly)
+
+    def test_checkpoint_must_be_reachable(self):
+        data = cartridge_image()
+        data[0x100] = 0x76
+        with self.assertRaisesRegex(ValueError, "checkpoint .* is unreachable"):
+            compile_rom(data, stop_at=(0, 0x101))
 
     def test_bank_remap_changes_the_next_instruction(self):
         data = cartridge_image()
