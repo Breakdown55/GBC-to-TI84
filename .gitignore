@@ -1,0 +1,8 @@
+__pycache__/
+/bank-switch-test/bin/
+/bank-switch-test/obj/
+/game-disassembly/
+*.gb
+*.gbc
+*.rom
+*.ce
