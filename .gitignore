@@ -1,0 +1,8 @@
+__pycache__/
+/native-test/bin/
+/native-test/obj/
+/game-disassembly/
+*.gb
+*.gbc
+*.rom
+*.ce
