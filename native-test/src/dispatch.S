@@ -16,8 +16,14 @@ _gb_call:
 
 _gb_ret:
     call _gb_pop_word
+    ld de, 0x10000
+    or a, a
+    sbc hl, de
+    jp nc, _gb_unmapped
+    add hl, de
 
 _gb_dispatch:
+    ld (_gb_pc), hl
     push hl
     call _gb_lookup
     pop bc
@@ -25,5 +31,5 @@ _gb_dispatch:
     ld de, 0
     or a, a
     sbc hl, de
-    jp z, _gb_unmapped
+    jp z, _gb_missing_target
     jp (hl)

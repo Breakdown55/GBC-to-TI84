@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "show_hex.h"
 
 #include <ti/getcsc.h>
 #include <ti/screen.h>
@@ -78,24 +79,17 @@ void gb_unmapped(void)
     dispatch_error = 1;
 }
 
+void gb_missing_target(void)
+{
+    gb_unmapped();
+}
+
 static uint8_t run_jump(uint16_t bank, GbNativeBlock jump)
 {
     gb_rom_bank = bank; /* Effect of the translated write to $2000. */
     jump_marker = 0;
     jump();
     return jump_marker;
-}
-
-static void show_hex(unsigned value, unsigned width)
-{
-    static const char digits[] = "0123456789ABCDEF";
-    char text[5];
-    text[width] = '\0';
-    while (width) {
-        text[--width] = digits[value & 0x0f];
-        value >>= 4;
-    }
-    os_PutStrFull(text);
 }
 
 static void show_bytes(const char *label, const volatile uint8_t *values, unsigned count)

@@ -20,6 +20,9 @@ extern const GbTarget gb_targets[];
 extern const unsigned gb_target_count;
 
 extern volatile uint16_t gb_rom_bank;
+extern uint16_t gb_rom_bank_mask;
+extern uint8_t gb_mbc5;
+extern volatile uint24_t gb_pc;
 extern volatile uint24_t gb_hl; /* Zero-extended Game Boy HL for ADL code. */
 extern volatile uint24_t gb_bc;
 extern volatile uint16_t gb_sp;
@@ -39,6 +42,7 @@ void gb_dec_c(void);
 uint8_t gb_read_high(uint8_t offset);
 void gb_write_high(uint8_t offset);
 uint8_t gb_store_hli(void);
+uint8_t gb_store_a(uint24_t address);
 uint8_t gb_push_word(uint24_t value);
 uint24_t gb_pop_word(void);
 void gb_unmapped(void);

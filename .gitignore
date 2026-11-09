@@ -6,3 +6,5 @@ __pycache__/
 *.gbc
 *.rom
 *.ce
+*.8xp
+*.map

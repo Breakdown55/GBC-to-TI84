@@ -18,7 +18,7 @@ def dispatch(address):
     return [f"ld hl, 0x{address:04x}", "jp _gb_dispatch"]
 
 
-def call_with_byte(helper, value):
+def call_with_arg(helper, value):
     return [f"ld hl, 0x{value:02x}", "push hl", f"call _{helper}", "pop bc"]
 
 
@@ -73,7 +73,7 @@ def lower_instruction(instruction, pc=None):
         immediate = re.fullmatch(r"\$([0-9a-f]{1,2})", parts[1])
         if immediate:
             value = int(immediate.group(1), 16)
-            return call_with_byte("gb_cp_a", value), 2
+            return call_with_arg("gb_cp_a", value), 2
     load = re.fullmatch(r"ld\s+(a|c|hl|sp)\s*,\s*\$([0-9a-f]{1,4})", normalized)
     if load:
         register, digits = load.groups()
@@ -92,16 +92,22 @@ def lower_instruction(instruction, pc=None):
             ], 3
     if re.fullmatch(r"ld\s+\[hl\+\]\s*,\s*a", normalized):
         return ["call _gb_store_hli", "or a, a", "jp z, _gb_unmapped"], 1
+    direct_store = re.fullmatch(r"ld\s+\[\$([0-9a-f]{1,4})\]\s*,\s*a", normalized)
+    if direct_store:
+        address = int(direct_store.group(1), 16)
+        return [
+            *call_with_arg("gb_store_a", address), "or a, a", "jp z, _gb_unmapped"
+        ], 3
     store = re.fullmatch(r"ldh\s+\[([^\]]+)\]\s*,\s*a", normalized)
     if store:
         address = high_address(store.group(1))
         if address is not None:
-            return call_with_byte("gb_write_high", address & 0xff), 2
+            return call_with_arg("gb_write_high", address & 0xff), 2
     read = re.fullmatch(r"ldh\s+a\s*,\s*\[([^\]]+)\]", normalized)
     if read:
         address = high_address(read.group(1))
         if address is not None:
-            return [*call_with_byte("gb_read_high", address & 0xff), "ld (_gb_a), a"], 2
+            return [*call_with_arg("gb_read_high", address & 0xff), "ld (_gb_a), a"], 2
     if len(parts) == 2 and parts[1] in ("hl", "bc"):
         symbol = f"_gb_{parts[1]}"
         if parts[0] == "push":
@@ -116,6 +122,8 @@ def lower_instruction(instruction, pc=None):
             ], 1
     if parts == ["ret"]:
         return ["jp _gb_ret"], None
+    if parts == ["halt"]:
+        return ["jp _gb_halt"], None
     if parts == ["jp", "hl"]:
         return ["ld hl, (_gb_hl)", "jp _gb_dispatch"], None
     if len(parts) == 2 and parts[0] in ("jp", "call"):

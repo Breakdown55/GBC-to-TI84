@@ -8,6 +8,9 @@ enum {
 };
 
 volatile uint16_t gb_rom_bank;
+uint16_t gb_rom_bank_mask;
+uint8_t gb_mbc5;
+volatile uint24_t gb_pc;
 volatile uint24_t gb_hl;
 volatile uint24_t gb_bc;
 volatile uint16_t gb_sp;
@@ -102,14 +105,30 @@ void gb_write_high(uint8_t offset)
     }
 }
 
+uint8_t gb_store_a(uint24_t address)
+{
+    if (address >= GB_WRAM_BASE && address < GB_WRAM_BASE + GB_WRAM_SIZE) {
+        gb_wram[address - GB_WRAM_BASE] = gb_a;
+    } else if (address >= GB_HRAM_BASE && address <= 0xffff) {
+        gb_write_high((uint8_t)address);
+    } else if (gb_mbc5 && address >= 0x2000 && address < 0x4000) {
+        uint16_t bank = gb_rom_bank;
+        if (address < 0x3000) {
+            bank = (bank & 0x100) | gb_a;
+        } else {
+            bank = (bank & 0xff) | ((uint16_t)(gb_a & 1) << 8);
+        }
+        gb_rom_bank = bank & gb_rom_bank_mask;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 uint8_t gb_store_hli(void)
 {
     uint16_t address = (uint16_t)gb_hl;
-    if (address >= GB_WRAM_BASE && address < GB_WRAM_BASE + GB_WRAM_SIZE) {
-        gb_wram[address - GB_WRAM_BASE] = gb_a;
-    } else if (address >= GB_HRAM_BASE) {
-        gb_write_high((uint8_t)address);
-    } else {
+    if (!gb_store_a(address)) {
         return 0;
     }
     gb_hl = (uint16_t)(address + 1);
