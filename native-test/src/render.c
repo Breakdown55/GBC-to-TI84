@@ -92,7 +92,11 @@ static uint16_t palette_color(unsigned group, uint8_t attributes, uint8_t color)
     return shades[(mapping >> (color * 2)) & 3];
 }
 
-enum { ROW_CACHE_SIZE = 32, TILE_WIDTH = 8 };
+enum {
+    ROW_CACHE_SIZE = 32, TILE_WIDTH = 8,
+    OBJECT_BAND_HEIGHT = 8, OBJECT_BANDS = GB_SCREEN_HEIGHT / OBJECT_BAND_HEIGHT,
+    OAM_OBJECTS = GB_OAM_SIZE / 4,
+};
 
 typedef struct {
     uint16_t pixels[TILE_WIDTH];
@@ -104,6 +108,27 @@ typedef struct {
 static TileRow row_cache[ROW_CACHE_SIZE];
 static uint16_t bg_colors[8][4];
 static uint16_t obj_colors[8][4];
+static uint8_t band_objects[OBJECT_BANDS][OAM_OBJECTS];
+static uint8_t band_counts[OBJECT_BANDS];
+
+static void prepare_objects(void)
+{
+    memset(band_counts, 0, sizeof(band_counts));
+    int height = gb_lcdc & TALL_OBJ ? 16 : 8;
+    /* Preserve OAM order so each scanline still selects its first ten objects. */
+    for (unsigned offset = 0; offset < GB_OAM_SIZE; offset += 4) {
+        int first = gb_oam[offset] - 16;
+        int last = first + height - 1;
+        if (last < 0 || first >= GB_SCREEN_HEIGHT) {
+            continue;
+        }
+        unsigned first_band = (first < 0 ? 0 : first) / OBJECT_BAND_HEIGHT;
+        unsigned last_band = (last >= GB_SCREEN_HEIGHT ? GB_SCREEN_HEIGHT - 1 : last) / OBJECT_BAND_HEIGHT;
+        for (unsigned band = first_band; band <= last_band; ++band) {
+            band_objects[band][band_counts[band]++] = offset;
+        }
+    }
+}
 
 static void prepare_frame(void)
 {
@@ -118,6 +143,7 @@ static void prepare_frame(void)
         }
     }
     if (gb_lcdc & OBJ_ENABLE) {
+        prepare_objects();
         count = gb_cgb ? 8 : 2;
         for (unsigned palette = 0; palette < count; ++palette) {
             for (unsigned color = 1; color < 4; ++color) {
@@ -214,7 +240,11 @@ static void render_objects(uint8_t y, uint16_t *pixels, uint8_t *background)
     unsigned count = 0;
     int height = (gb_lcdc & TALL_OBJ) ? 16 : 8;
     bool sort_by_x = !gb_cgb || obj_x_priority;
-    for (unsigned offset = 0; offset < sizeof(gb_oam) && count < MAX_SCANLINE_OBJECTS; offset += 4) {
+    unsigned band = y / OBJECT_BAND_HEIGHT;
+    const uint8_t *candidates = band_objects[band];
+    unsigned candidate_count = band_counts[band];
+    for (unsigned i = 0; i < candidate_count && count < MAX_SCANLINE_OBJECTS; ++i) {
+        unsigned offset = candidates[i];
         int row = y + 16 - gb_oam[offset];
         if (row < 0 || row >= height) {
             continue;

@@ -564,7 +564,12 @@ uint8_t gb_watch_ram(uint16_t address)
 
 static uint16_t read_rom(uint16_t address)
 {
+    static const GbRomSpan *last_span;
     uint16_t bank = address < 0x4000 ? 0 : gb_rom_bank;
+    if (last_span && last_span->bank == bank &&
+        (uint16_t)(address - last_span->address) < last_span->length) {
+        return gb_rom_payload[last_span->offset + address - last_span->address];
+    }
     unsigned first = 0, last = gb_rom_data_count;
     while (first < last) {
         unsigned middle = first + (last - first) / 2;
@@ -574,6 +579,7 @@ static uint16_t read_rom(uint16_t address)
         } else if (span->bank > bank || address < span->address) {
             last = middle;
         } else {
+            last_span = span;
             return gb_rom_payload[span->offset + address - span->address];
         }
     }
@@ -653,12 +659,12 @@ static uint8_t write_sram(uint24_t address, uint8_t value)
 
 static uint16_t read_memory(uint24_t address)
 {
+    if (address < 0x8000) {
+        return read_rom((uint16_t)address);
+    }
     uint8_t *byte = ram_byte(address);
     if (byte) {
         return *byte;
-    }
-    if (address < 0x8000) {
-        return read_rom((uint16_t)address);
     }
     if (address >= 0xa000 && address < 0xc000) {
         return read_sram(address);

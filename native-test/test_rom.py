@@ -356,6 +356,19 @@ class RomTest(unittest.TestCase):
         self.assertIn("{0x000, 0x0300, 0x0006, 0x000000}", targets)
         self.assertIn("0x00, 0x01, 0x02, 0x03, 0x04, 0x05,", targets)
 
+    def test_fixed_memory_access_keeps_timing_and_banked_lookup(self):
+        data = cartridge_image()
+        code = bytes.fromhex("fa 00 03 ea 23 c1 fa 23 e1 e0 80 f0 80 fa 00 40 76")
+        data[0x100:0x100 + len(code)] = code
+        data[0x300] = 0xa5
+        assembly, _ = compile_rom(data, stop_at=(0, 0x100 + len(code)), timing=True)
+        self.assertIn("call _gb_boundary\n    ld a, 0xa5\n    ld (_gb_a), a", assembly)
+        self.assertIn("ld (_gb_wram+291), a", assembly)
+        self.assertIn("ld a, (_gb_wram+291)", assembly)
+        self.assertIn("ld (_gb_hram+0), a", assembly)
+        self.assertIn("ld a, (_gb_hram+0)", assembly)
+        self.assertIn("ld hl, 0x4000\n    push hl\n    call _gb_load_a", assembly)
+
     def test_live_input_keeps_the_pressed_branch_after_the_delay(self):
         data, (_, resume) = frame_rom()
         # Select buttons, then skip the marker write when A is released.

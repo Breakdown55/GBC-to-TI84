@@ -1142,6 +1142,30 @@ def outline_repeated(assembly, repeated):
     return result
 
 
+def fixed_memory_access(data, instruction):
+    opcode, address = instruction.opcode, instruction.operand
+    if opcode in (0xe0, 0xf0):
+        address |= 0xff00
+    elif opcode not in (0xea, 0xfa):
+        return None
+
+    load = opcode in (0xfa, 0xf0)
+    if load and address < BANK_SIZE:
+        source = f"0x{data[address]:02x}"
+        return [f"ld a, {source}", "ld (_gb_a), a"]
+
+    address = ram_address(address)
+    if 0xc000 <= address < 0xd000:
+        cell = f"_gb_wram+{address - 0xc000}"
+    elif HRAM_BASE <= address < HRAM_END:
+        cell = f"_gb_hram+{address - HRAM_BASE}"
+    else:
+        return None
+    if load:
+        return [f"ld a, ({cell})", "ld (_gb_a), a"]
+    return ["ld a, (_gb_a)", f"ld ({cell}), a"]
+
+
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
                 analysis_limit=DEFAULT_ANALYSIS_LIMIT):
@@ -1168,15 +1192,18 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
         opcode = instruction.opcode
         in_ram = pc in cartridge.ram_code
-        checked = CHECKED_HELPERS.get(opcode) if not timing and not in_ram else None
+        fixed = None if in_ram else fixed_memory_access(data, instruction)
+        checked = CHECKED_HELPERS.get(opcode) if not timing and not in_ram and fixed is None else None
         cb_memory = opcode == 0xcb and instruction.operand & 7 == 6
         remaps = opcode in (*MEMORY_STORES, 0x34, 0x35) or (
             cb_memory and instruction.operand >> 6 != 1
         )
+        if fixed is not None:
+            remaps = False
         if timing and opcode not in (CHECKPOINT, UNSUPPORTED):
             assembly.extend([f"    ld hl, 0x{pc:04x}", f"    ld de, {instruction.tcycles()}",
                              "    call _gb_boundary"])
-        elif checked is None and (in_ram or remaps or cb_memory or opcode & 0xc7 == 0xc7 or opcode in (
+        elif fixed is None and checked is None and (in_ram or remaps or cb_memory or opcode & 0xc7 == 0xc7 or opcode in (
                 CHECKPOINT, UNSUPPORTED, 0x10, 0x76, 0xcd, 0xe0, 0xe2, *MEMORY_LOADS, *PUSHES, *POPS,
                 *RETURNS, *CONDITIONAL_CALL) or 0x80 <= opcode < 0xc0 and opcode & 7 == 6):
             assembly.extend([f"    ld hl, 0x{pc:04x}", "    ld (_gb_pc), hl"])
@@ -1197,7 +1224,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         if native is not None:
             assembly.extend(f"    {line}" for line in native)
             continue
-        if checked:
+        if fixed is not None:
+            native, size = fixed, instruction.size
+        elif checked:
             helper, argument = checked
             helpers.add(checked)
             native = [f"ld hl, 0x{instruction.operand:04x}", f"ld de, 0x{pc:04x}"] if argument else [
