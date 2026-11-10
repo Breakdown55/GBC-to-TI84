@@ -92,7 +92,7 @@ def main():
     parser.add_argument("--stop-at", type=parse_entry,
                         help="stop before executing this hexadecimal BANK:ADDRESS")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
-                        help="hexadecimal WRAM or HRAM address to display after execution")
+                        help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Z][A-Z0-9]{0,7}", args.name):
         parser.error("--name must start with A-Z and contain at most eight letters or digits")
@@ -100,7 +100,7 @@ def main():
     if output.suffix.lower() != ".8xp" or args.rom.resolve() in (output, output.with_suffix(".map")):
         parser.error("the .8xp and .map outputs must be separate from the input")
     if args.watch == 0:
-        parser.error("--watch must be a WRAM or HRAM address")
+        parser.error("--watch must be a VRAM, WRAM, or HRAM address")
     try:
         assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at)
         ce = toolchain_path(args.cedev)
