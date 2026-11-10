@@ -826,6 +826,43 @@ uint8_t gb_store_hld(void)
     return 1;
 }
 
+/* Fuse LD [HL+],A / DEC B-or-C / JR NZ for untimed translation only.
+ * Reject MMIO, cartridge RAM, and crossings before touching guest state. */
+uint8_t gb_fill_hl(uint8_t use_b)
+{
+    if (gb_timing_enabled) return 0;
+    uint16_t original = (uint16_t)gb_hl;
+    unsigned address = original;
+    unsigned count = use_b ? (gb_bc >> 8) & 255 : gb_bc & 255;
+    if (!count) count = 256;
+    if (address >= 0xe000 && address < 0xfe00) {
+        if (count > 0xfe00 - address) return 0;
+        address -= 0x2000;
+    }
+    uint8_t *bytes;
+    uint8_t video = address >= 0x8000 && address < 0xa000;
+    if (video && count <= 0xa000 - address) {
+        bytes = &gb_vram[gb_cgb ? gb_vbk : 0][address - 0x8000];
+    } else if (address >= 0xc000 && address < 0xe000 && count <= 0x1000 - (address & 0xfff)) {
+        bytes = work_or_high_ram_byte(address);
+    } else if (address >= 0xff80 && address < 0xffff && count <= 0xffff - address) {
+        bytes = &gb_hram[address - 0xff80];
+    } else {
+        return 0;
+    }
+    uint8_t value = gb_a;
+    unsigned changed = 0;
+    while (changed < count && bytes[changed] == value) ++changed;
+    if (changed < count) {
+        memset(bytes, value, count);
+        if (video) gb_video_invalidate(gb_cgb ? gb_vbk : 0, address - 0x8000, count);
+    }
+    gb_hl = (uint16_t)(original + count);
+    gb_bc &= use_b ? 0xff : 0xff00;
+    gb_f = (gb_f & GB_FLAG_C) | GB_FLAG_Z | GB_FLAG_N;
+    return 1;
+}
+
 uint8_t gb_set_hl_bit(uint8_t bit)
 {
     uint16_t address = (uint16_t)gb_hl;

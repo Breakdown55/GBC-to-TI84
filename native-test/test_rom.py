@@ -183,6 +183,40 @@ def tilemap_rom():
 
 
 class RomTest(unittest.TestCase):
+    def test_frame_join_keeps_banking_stack_and_sram_distinct(self):
+        from dataclasses import replace
+        from rom import State, KnownMemory, merge_frame_states, SRAM_BASE
+        states = [State(0x100, 1, stack=(1,2), memory=KnownMemory(((0xc000,0xc001,n),
+                  (0xc001,0xc002,7),(SRAM_BASE,SRAM_BASE+1,3)))) for n in range(9)]
+        joined = list(merge_frame_states(states))
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(joined[0].memory, ((0xc001,0xc002,7),(SRAM_BASE,SRAM_BASE+1,3)))
+        self.assertEqual(len(merge_frame_states([*states, replace(states[0], bank=2)])), 2)
+        self.assertEqual(len(merge_frame_states([*states, replace(states[0], stack=(3,4))])), 2)
+
+    def test_byte_fill_loop_fuses_only_without_instruction_timing(self):
+        data = cartridge_image()
+        code = bytes.fromhex("21 00 c0 0e 00 3e a5 22 0d 20 fc 76")
+        data[0x100:0x100+len(code)] = code
+        assembly, _ = compile_rom(data)
+        self.assertEqual(assembly.count("call _gb_fill_hl"), 1)
+        self.assertIn("jp z, .Lfill_slow_000_0107", assembly)
+        timed, _ = compile_rom(data, timing=True, stop_at=(0,0x10b))
+        self.assertNotIn("call _gb_fill_hl", timed)
+
+    def test_unknown_fill_counter_has_only_256_possible_lengths(self):
+        from rom import State
+        data = cartridge_image()
+        data[0x100:0x105] = bytes.fromhex("22 0d 20 fc 76")
+        cartridge = Cartridge(data)
+        state = State(0x100, 1, a=0xa5, hl=(0, 0xc0), c=None)
+        successors, _ = cartridge.fold_fill(state, cartridge.decode(0,0x100), None)
+        self.assertEqual(len(successors), 256)
+        self.assertEqual({s.hl for s in successors}, {(n & 255, 0xc0 + (n >> 8)) for n in range(1,257)})
+        self.assertTrue(all(s.c == 0 and s.z is True for s in successors))
+        crossing = State(0x100, 1, a=0xa5, hl=(0xff, 0xfd), c=2)
+        self.assertIsNone(cartridge.fold_fill(crossing, cartridge.decode(0,0x100), None))
+
     def test_reachable_code_and_banks(self):
         data = synthetic_rom()
         instructions = Cartridge(data).discover()
@@ -227,7 +261,7 @@ class RomTest(unittest.TestCase):
         self.assertIn("{0x001, 0x4567, 0x0002, 0x000000}", targets)
         self.assertIn("{0x002, 0x4567, 0x0001, 0x000002}", targets)
         self.assertIn("0x3c, 0x76, 0xa5,", targets)
-        self.assertIn("call _gb_load_hli", assembly)
+        self.assertIn("call _gb_fast_load_hli", assembly)
         self.assertIn("call _gb_stop", assembly)
 
     def test_counted_loop_stops_before_checkpoint_instruction(self):
@@ -333,6 +367,28 @@ class RomTest(unittest.TestCase):
         self.assertIn(f"gb_000_{resume:04x}", multiple)
         self.assertEqual(assembly.count("jp _gb_preview_vblank"), 2)
         self.assertIn("rom_preview_frames = 2", multiple)
+
+    def test_continuous_vblank_has_no_runtime_frame_limit(self):
+        data, (_, resume) = frame_rom()
+        data[resume:resume + 4] = bytes((0x76, 0xc3, resume & 255, resume >> 8))
+        assembly, targets = compile_rom(data, vblank_preview=3, continuous=True)
+        self.assertIn("rom_preview_frames = 0", targets)
+        self.assertIn("jp _gb_preview_vblank", assembly)
+        self.assertIn(f"gb_000_{resume:04x}", targets)
+        self.assertNotIn("jp _gb_checkpoint", assembly)
+
+    def test_native_arithmetic_keeps_carry_setup_and_compare_accumulator(self):
+        from translate import lower_instruction
+        adc, size = lower_instruction("adc a, b")
+        self.assertEqual(size, 1)
+        self.assertIn("add a, 0xf0", adc)
+        self.assertIn("adc a, c", adc)
+        self.assertIn("call _gb_native_flags", adc)
+        compare, _ = lower_instruction("cp $ff")
+        self.assertNotIn("ld (_gb_a), a", compare)
+        self.assertIn("cp a, 0xff", compare)
+        decrement, _ = lower_instruction("dec h")
+        self.assertIn("call _gb_native_step_flags", decrement)
 
     def test_preview_shares_repeated_native_bodies(self):
         data = cartridge_image()

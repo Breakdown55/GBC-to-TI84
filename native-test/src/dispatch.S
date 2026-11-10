@@ -1,4 +1,133 @@
     .assume ADL=1
+    .section .text.gb_fast_ram
+    .macro fast_hl name, fallback, store, step
+    .global _gb_fast_\name
+_gb_fast_\name:
+    ld hl, (_gb_hl)
+    call .Lplain_ram
+    jp c, _gb_\fallback
+    .if \store
+    ld a, (_gb_a)
+    ld (hl), a
+    .else
+    ld a, (hl)
+    ld (_gb_a), a
+    .endif
+    .if \step
+    ld hl, (_gb_hl)
+    .if \step > 0
+    inc hl
+    .else
+    dec hl
+    .endif
+    ld (_gb_hl), hl
+    xor a, a
+    ld (_gb_hl+2), a
+    .endif
+    ld a, 1
+    ret
+    .endm
+
+    fast_hl load_hli, load_hli, 0, 1
+    fast_hl load_hld, load_hld, 0, -1
+    fast_hl store_hl, store_hl, 1, 0
+    fast_hl store_hli, store_hli, 1, 1
+    fast_hl store_hld, store_hld, 1, -1
+
+/* Only plain WRAM, its echo, and HRAM bypass the general memory bus.
+ * VRAM, OAM, ROM, cartridge RAM, and MMIO retain their existing side effects. */
+.Lplain_ram:
+    ld a, h
+    cp a, 0xc0
+    ret c
+    cp a, 0xfe
+    jr nc, .Lhigh_ram
+    and a, 0x1f
+    cp a, 0x10
+    jr nc, .Lbanked_ram
+    ld h, a
+    ld de, _gb_wram
+    add hl, de
+    or a, a
+    ret
+.Lbanked_ram:
+    and a, 0x0f
+    ld h, a
+    ld a, (_gb_cgb)
+    or a, a
+    ld a, 1
+    jr z, .Lram_bank
+    ld a, (_gb_svbk)
+    or a, a
+    jr nz, .Lram_bank
+    inc a
+.Lram_bank:
+    dec a
+    rlca
+    rlca
+    rlca
+    rlca
+    add a, h
+    ld h, a
+    ld de, _gb_wram_banks
+    add hl, de
+    or a, a
+    ret
+.Lhigh_ram:
+    cp a, 0xff
+    jr nz, .Lnot_plain_ram
+    ld a, l
+    sub a, 0x80
+    ret c
+    cp a, 0x7f
+    jr z, .Lnot_plain_ram
+    ld hl, _gb_hram
+    ld de, 0
+    ld e, a
+    add hl, de
+    or a, a
+    ret
+.Lnot_plain_ram:
+    scf
+    ret
+
+    .section .text.gb_native_flags
+    .global _gb_native_flags
+    .global _gb_native_step_flags
+_gb_native_flags:
+    push af
+    pop hl
+    ld a, l
+    ld hl, .Lflag_map
+    ld l, a
+    ld a, (hl)
+    ld (_gb_f), a
+    ret
+
+_gb_native_step_flags:
+    push af
+    pop hl
+    ld a, l
+    ld hl, .Lflag_map
+    ld l, a
+    ld a, (hl)
+    and a, 0xe0
+    ld c, a
+    ld a, (_gb_f)
+    and a, 0x10
+    or a, c
+    ld (_gb_f), a
+    ret
+
+    .section .rodata.gb_native_flags
+    .balign 256
+.Lflag_map:
+    .set .Lflags, 0
+    .rept 256
+    .byte ((.Lflags & 0x40) << 1) | ((.Lflags & 0x10) << 1) | ((.Lflags & 2) << 5) | ((.Lflags & 1) << 4)
+    .set .Lflags, .Lflags + 1
+    .endr
+
     .section .text
     .global _gb_dispatch
     .global _gb_ret

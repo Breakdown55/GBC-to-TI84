@@ -7,6 +7,17 @@ import unittest
 
 
 class RenderCacheTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("gcc"), "host gcc is required for fill tests")
+    def test_bulk_fill_boundaries_and_register_effects(self):
+        root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(prefix="render-test-", dir=root) as directory:
+            exe = Path(directory) / "fill-test.exe"
+            subprocess.run(["gcc", "-std=c11", "-O2", "-ffunction-sections", "-fdata-sections",
+                            "-Wl,--gc-sections", "-Duint24_t=uint32_t", "-I", str(root / "src"),
+                            str(root / "tests/fill_loop.c"), str(root / "src/runtime.c"),
+                            "-o", str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
+
     @unittest.skipUnless(shutil.which("gcc"), "host gcc is required for DMA tests")
     def test_dma_invalidates_changed_ranges_only(self):
         root = Path(__file__).resolve().parent

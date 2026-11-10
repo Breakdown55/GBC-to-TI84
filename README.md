@@ -26,11 +26,17 @@ Use `--stop-at BANK:ADDRESS` to stop before executing a reachable instruction. U
 
 `--vblank-preview [FRAMES]` is a graphics diagnostic. It advances to VBlank when the guest waits at `HALT` and displays the result after the requested number of handlers return. For routines copied to high RAM, `--ram-code START:BANK:SOURCE:LENGTH` supplies the ROM bytes used to translate and validate the executable copy. All four fields are hexadecimal.
 
+For continuous HALT-driven execution, use `--live --vblank-run`. It has no runtime frame limit and exits with `Clear`. `--analysis-frames N` controls how many VBlanks the compiler explores, independently of execution. This mode uses approximate timing, like the preview; use `--live` without either VBlank option for instruction-boundary timing. Static discovery is still incomplete for arbitrary inputs and dynamic destinations, so execution can report an unsupported instruction or missing target beyond the compiled paths. A larger analysis horizon does not guarantee complete game coverage. `--analysis-progress` reports progress during long compilations.
+
+`--frame-skip 1` presents every other guest frame while keeping input polling and guest interrupts on every frame. At full guest speed this corresponds to about 30 presentations per second. Frame skipping alone does not make guest execution real-time.
+
 Renderer optimizations are automatic for every cartridge the compiler supports. The calculator displays 8-bit palette indices, so palette changes can update colors without redrawing pixels. A decoded-tile cache covers both video RAM banks, and a retained background layer avoids rebuilding the background beneath moving sprites. Background updates resolve map entries once per tile rectangle. CPU stores and DMA transfers invalidate the affected tiles and map cells. Changes to scrolling or display layout rebuild the background. Sprite composition preserves transparency, priority, flips, and the ten-sprites-per-scanline limit.
 
 These caches occupy 75,776 bytes in the unused half of LCD memory while the indexed display is active. They do not consume that amount of the program's code/data RAM. This remains a frame-based renderer; caching does not add scanline-accurate mid-frame video effects.
 
 The compiler also packs nearby cartridge data ranges together and shares repeated native instruction sequences in VBlank preview builds. It makes those decisions from the input ROM and generated code.
+
+Register arithmetic uses native eZ80 operations with Game Boy flag conversion. Plain WRAM and HRAM accesses have native fast paths, while mapped devices retain their memory handlers. In untimed modes, recognized byte-fill loops can use bulk fills when the entire destination is safe; timed builds retain individual instruction boundaries. Static analysis also summarizes these bounded fills and can merge compatible RAM facts between frames during continuous discovery.
 
 For a cartridge that waits at `HALT` for VBlank, build a live preview with:
 

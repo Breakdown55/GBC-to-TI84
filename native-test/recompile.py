@@ -72,7 +72,7 @@ def guard_compressed_program(run, work):
     path.write_bytes(program)
 
 
-def build(ce, work, name, show_frame=False, input_after=None):
+def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0):
     def run(tool, *args):
         subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
 
@@ -99,11 +99,13 @@ def build(ce, work, name, show_frame=False, input_after=None):
             "-ffunction-sections", "-fdata-sections", "-mllvm", "-z80-gas-style",
             "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}",
             f"-DGB_LIVE={int(input_after is not None)}", f"-DGB_INPUT_AFTER={input_after or 0}", "-nostdinc",
+            f"-DGB_FRAME_SKIP={frame_skip}",
             "-isystem", ce / "include", "-I", PROJECT / "src",
             source, "-o", f"{unit}.s")
         run(assembler, "-march=ez80+full", f"{unit}.s", "-o", f"{unit}.o")
         objects.append(f"{unit}.o")
-    run(assembler, "-march=ez80+full", PROJECT / "src/dispatch.S", "-o", "dispatch.o")
+    # GAS macro diagnostics reparse source paths; Windows backslashes become escapes.
+    run(assembler, "-march=ez80+full", (PROJECT / "src/dispatch.S").as_posix(), "-o", "dispatch.o")
     run(assembler, "-march=ez80+full", "translated.s", "-o", "translated.o")
     run(linker, "-i", "-static", "--entry=__start", "--build-id=none", "--gc-sections",
         "--omagic", "--defsym=__TICE__=1", "--defsym=NDEBUG=1",
@@ -178,6 +180,12 @@ def main():
     clock.add_argument("--timing", action="store_true", help="enable guest timing and interrupts")
     clock.add_argument("--vblank-preview", nargs="?", type=int, const=1, default=None, metavar="FRAMES",
                        help="serve this many VBlank interrupts at HALT and show the result (default: 1)")
+    clock.add_argument("--vblank-run", action="store_true",
+                       help="run HALT-driven VBlanks without a frame limit (approximate timing)")
+    parser.add_argument("--analysis-frames", type=int, default=1200,
+                        help="static discovery horizon for --vblank-run, not an execution limit (default: 1200)")
+    parser.add_argument("--frame-skip", type=int, default=0,
+                        help="skip this many presentations between drawn frames; input and guest frames still run")
     parser.add_argument("--frame", action="store_true", help="show the guest display on a normal stop")
     parser.add_argument("--live", action="store_true", help="update the display and read keys at VBlank")
     parser.add_argument("--input-after", type=int, help="wait this many VBlanks before accepting guest buttons")
@@ -187,6 +195,7 @@ def main():
                         help="build with runtime faults for unsupported opcodes")
     parser.add_argument("--analysis-limit", type=int, default=DEFAULT_ANALYSIS_LIMIT,
                         help="maximum number of analysis states (default: %(default)s)")
+    parser.add_argument("--analysis-progress", action="store_true", help="report static discovery progress")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
@@ -201,23 +210,35 @@ def main():
         parser.error("--analysis-limit must be positive")
     if args.vblank_preview is not None and not 1 <= args.vblank_preview <= 0xffffff:
         parser.error("--vblank-preview expects a positive 24-bit frame count")
-    preview_frames = args.vblank_preview or 0
+    if not 1 <= args.analysis_frames <= 0xffffff:
+        parser.error("--analysis-frames must be from 1 to 16777215")
+    if not 0 <= args.frame_skip <= 255:
+        parser.error("--frame-skip must be from 0 to 255")
+    if args.vblank_run and not args.live:
+        parser.error("--vblank-run requires --live")
+    if args.frame_skip and not args.live:
+        parser.error("--frame-skip requires --live")
+    preview_frames = args.analysis_frames if args.vblank_run else args.vblank_preview or 0
     if args.input_after is not None and (not args.live or not 0 <= args.input_after < 0xffffff):
         parser.error("--input-after requires --live and a frame count from 0 to 16777214")
     input_after = (args.input_after or 0) if args.live else None
     timing = args.timing or (args.live and not preview_frames)
+    def progress(states, instructions, frames):
+        print(f"Analysis: {states:,} states, {instructions:,} instructions, {frames} VBlanks", flush=True)
     try:
         assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at,
                                       timing=timing, trap_unsupported=args.trap_unsupported,
                                       ram_code=args.ram_code, vblank_preview=preview_frames,
-                                      input_after=input_after, analysis_limit=args.analysis_limit)
+                                      input_after=input_after, analysis_limit=args.analysis_limit,
+                                      continuous=args.vblank_run,
+                                      progress=progress if args.analysis_progress else None)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:
             work = Path(directory)
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
-            archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after)
+            archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after, args.frame_skip)
             os.replace(work / "program.8xp", output)
             os.replace(work / "program.map", output.with_suffix(".map"))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

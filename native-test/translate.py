@@ -18,7 +18,6 @@ HIGH_REGISTERS = {
     "rbcps": 0xff68, "rbcpd": 0xff69, "rocps": 0xff6a, "rocpd": 0xff6b, "ropri": 0xff6c,
     "rsvbk": 0xff70, "rie": 0xffff,
 }
-BYTE_STEPS = {("inc", "a"), ("inc", "c"), ("dec", "b"), ("dec", "c")}
 BYTE_REGISTERS = {
     "a": "_gb_a", "b": "_gb_bc+1", "c": "_gb_bc", "h": "_gb_hl+1", "l": "_gb_hl",
     "d": "_gb_de+1", "e": "_gb_de",
@@ -39,13 +38,6 @@ def dispatch(address):
 
 def call_with_arg(helper, value):
     return [f"ld hl, 0x{value:02x}", "push hl", f"call _{helper}", "pop bc"]
-
-
-def call_with_byte(helper, first, register):
-    return [
-        "ld hl, 0", f"ld a, ({BYTE_REGISTERS[register]})", "ld l, a", "push hl",
-        *call_with_arg(helper, first), "pop bc",
-    ]
 
 
 def flag_bit(condition):
@@ -118,16 +110,13 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         return ["ld a, 1", "ld (_gb_ime), a"], 1
     if parts == ["stop"]:
         return ["call _gb_stop", *FAULT_IF_ZERO], 2
-    if tuple(parts) in BYTE_STEPS:
-        return [f"call _gb_{parts[0]}_{parts[1]}"], 1
     if len(parts) == 2 and parts[0] in ("inc", "dec"):
         decrement = int(parts[0] == "dec")
         register = parts[1]
         if register in BYTE_REGISTERS:
             return [
-                f"ld hl, {decrement}", "push hl",
-                "ld hl, 0", f"ld a, ({BYTE_REGISTERS[register]})", "ld l, a", "push hl",
-                "call _gb_step_byte", "pop bc", "pop bc", f"ld ({BYTE_REGISTERS[register]}), a",
+                f"ld a, ({BYTE_REGISTERS[register]})", f"{parts[0]} a",
+                f"ld ({BYTE_REGISTERS[register]}), a", "call _gb_native_step_flags",
             ], 1
         if register == "[hl]":
             return [*call_with_arg("gb_step_hl", decrement), *FAULT_IF_ZERO], 1
@@ -152,8 +141,6 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         offset = int(sp_add[2], 16) * (-1 if sp_add[1] else 1)
         if -128 <= offset <= 127:
             return call_with_arg("gb_add_sp", offset & 0xff), 2
-    if parts == ["sub", "l"]:
-        return ["call _gb_sub_l"], 1
     if parts == ["srl", "a"]:
         return ["call _gb_srl_a"], 2
     if len(parts) == 1 and parts[0] in ROTATES:
@@ -205,23 +192,19 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             *load, *carry, *native, "ld b, 0", "jr nz, 1f", "set 7, b", "1:",
             "jr nc, 2f", "set 4, b", "2:", "ld c, a", "ld a, b", "ld (_gb_f), a", "ld a, c", *store,
         ], 2
-    if len(parts) == 2 and parts[0] == "cp":
-        immediate = re.fullmatch(r"\$([0-9a-f]{1,2})", parts[1])
-        if immediate:
-            value = int(immediate.group(1), 16)
-            return call_with_arg("gb_cp_a", value), 2
     alu = re.fullmatch(r"(add|adc|sub|sbc|and|xor|or|cp)\s+(?:a\s*,\s*)?([abcdehl]|\[hl\]|\$[0-9a-f]{1,2})", normalized)
     if alu:
         operation = ALU_OPERATIONS.index(alu[1])
         operand = alu[2]
         if operand == "[hl]":
             return [*call_with_arg("gb_alu_hl", operation), *FAULT_IF_ZERO], 1
-        if operand.startswith("$"):
-            return [
-                f"ld hl, 0x{int(operand[1:], 16):02x}", "push hl",
-                *call_with_arg("gb_alu", operation), "pop bc",
-            ], 2
-        return call_with_byte("gb_alu", operation, operand), 1
+        immediate = operand.startswith("$")
+        setup = [] if immediate else [f"ld a, ({BYTE_REGISTERS[operand]})", "ld c, a"]
+        carry = ["ld a, (_gb_f)", "and a, 0x10", "add a, 0xf0"] if alu[1] in ("adc", "sbc") else []
+        argument = f"0x{int(operand[1:], 16):02x}" if immediate else "c"
+        store = [] if alu[1] == "cp" else ["ld (_gb_a), a"]
+        return [*setup, *carry, "ld a, (_gb_a)", f"{alu[1]} a, {argument}",
+                *store, "call _gb_native_flags"], 2 if immediate else 1
     register_load = re.fullmatch(r"ld\s+([abcdehl])\s*,\s*([abcdehl])", normalized)
     if register_load:
         dest, source = (BYTE_REGISTERS[register] for register in register_load.groups())
@@ -248,11 +231,11 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             ], 3
     indirect_store = re.fullmatch(r"ld\s+\[hl([+-]?)\]\s*,\s*a", normalized)
     if indirect_store:
-        helper = {"": "gb_store_hl", "+": "gb_store_hli", "-": "gb_store_hld"}[indirect_store[1]]
+        helper = {"": "gb_fast_store_hl", "+": "gb_fast_store_hli", "-": "gb_fast_store_hld"}[indirect_store[1]]
         return [f"call _{helper}", *FAULT_IF_ZERO], 1
     hl_load = re.fullmatch(r"ld\s+a\s*,\s*\[hl([+-])\]", normalized)
     if hl_load:
-        helper = "_gb_load_hli" if hl_load[1] == "+" else "_gb_load_hld"
+        helper = "_gb_fast_load_hli" if hl_load[1] == "+" else "_gb_fast_load_hld"
         return [f"call {helper}", *FAULT_IF_ZERO], 1
     register_load = re.fullmatch(r"ld\s+([abcdehl])\s*,\s*\[(hl|de|bc)\]", normalized)
     if register_load:

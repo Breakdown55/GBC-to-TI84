@@ -133,6 +133,48 @@ class KnownMemory(tuple):
 EMPTY_MEMORY = KnownMemory()
 
 
+def common_memory(first, second):
+    """Retain facts true on both paths. Missing RAM facts mean unknown."""
+    result = []
+    i = j = 0
+    while i < len(first) and j < len(second):
+        a, b, value = first[i]
+        c, d, other = second[j]
+        start, end = max(a, c), min(b, d)
+        if start < end and value == other:
+            if result and result[-1][1] == start and result[-1][2] == value:
+                result[-1] = result[-1][0], end, value
+            else:
+                result.append((start, end, value))
+        if b <= d: i += 1
+        if d <= b: j += 1
+    return KnownMemory(result)
+
+
+def merge_frame_states(states):
+    """Bound input-history duplication without merging registers or return stacks.
+
+    SRAM facts are part of the key because an absent erased-SRAM fact means FF,
+    unlike ordinary RAM where absence means unknown. VRAM and banking state
+    also remain distinct. A few concrete alternatives avoid needless widening.
+    """
+    groups = {}
+    for state in states:
+        sram = KnownMemory(run for run in state.memory if SRAM_BASE <= run[0] < WRAM_BANKS_BASE)
+        key = replace(state, memory=sram)
+        groups.setdefault(key, []).append(state)
+    result = deque()
+    for alternatives in groups.values():
+        if len(alternatives) <= 8:
+            result.extend(alternatives)
+            continue
+        memory = alternatives[0].memory
+        for state in alternatives[1:]:
+            memory = common_memory(memory, state.memory)
+        result.append(replace(alternatives[0], memory=memory))
+    return result
+
+
 @dataclass(frozen=True)
 class SavedFlags:
     zero: Optional[bool]
@@ -947,7 +989,7 @@ class Cartridge:
 
     def discover(self, extra_entries=(), stop_at=None, rom_bytes=None, *, timing=False,
                  trap_unsupported=False, vblank_preview=False, dispatch_targets=None,
-                 input_after=None, analysis_limit=DEFAULT_ANALYSIS_LIMIT):
+                 input_after=None, analysis_limit=DEFAULT_ANALYSIS_LIMIT, progress=None, merge_frames=False):
         if not isinstance(vblank_preview, int) or not 0 <= vblank_preview <= 0xffffff:
             raise ValueError("VBlank preview frame count must fit in an unsigned 24-bit integer")
         if timing and vblank_preview:
@@ -991,13 +1033,15 @@ class Cartridge:
             if not work:
                 # Returning from VBlank can only decrease the remaining frame count.
                 # Finish this frame before visiting the next so old states can be freed.
-                work, next_frame = next_frame, work
+                work, next_frame = merge_frame_states(next_frame) if merge_frames else next_frame, work
                 seen.clear()
             state = work.popleft()
             if state in seen:
                 continue
             seen.add(state)
             state_count += 1
+            if progress is not None and state_count % 100_000 == 0:
+                progress(state_count, len(instructions), int(vblank_preview) - state.preview_remaining)
             bank, _ = address_key(state)
             location = f"${bank:03X}:${state.pc:04X}"
             try:
@@ -1030,6 +1074,22 @@ class Cartridge:
                 opcode = instruction.opcode
                 if opcode == UNSUPPORTED:
                     continue
+                folded = None if timing else self.fold_fill(state, instruction, stop_at)
+                if folded is not None:
+                    successors, tail = folded
+                    for tail_pc, tail_instruction in tail:
+                        for byte_pc in range(tail_pc, tail_pc + tail_instruction.size):
+                            owner = occupied.setdefault((bank, byte_pc), tail_pc)
+                            if owner != tail_pc:
+                                raise ValueError(f"instruction overlaps code at ${owner:04X}")
+                        instructions[bank, tail_pc] = tail_instruction
+                        if dispatch_targets is not None:
+                            dispatch_targets.add((bank, tail_pc))
+                    for successor in successors:
+                        if dispatch_targets is not None:
+                            dispatch_targets.add(address_key(successor))
+                        work.append(successor)
+                    continue
                 successors = self.successors(state, instruction, rom_bytes, timing=timing)
                 if dispatch_targets is not None:
                     if opcode == 0xe9 and join_word(*state.hl) is None:
@@ -1051,6 +1111,64 @@ class Cartridge:
         if stop_at is not None and stop_at not in instructions:
             raise ValueError(f"checkpoint ${stop_at[0]:03X}:${stop_at[1]:04X} is unreachable")
         return instructions
+
+    def fold_fill(self, state, instruction, stop_at):
+        """Summarize the same bounded fill loop that the native backend fuses."""
+        pc = state.pc
+        bank, _ = address_key(state)
+        if instruction.opcode != 0x22 or pc in self.ram_code or pc // BANK_SIZE != (pc + 4) // BANK_SIZE:
+            return None
+        if stop_at in ((bank, pc + 1), (bank, pc + 2), (bank, pc + 3)):
+            return None
+        try:
+            step, branch = self.decode(bank, pc + 1), self.decode(bank, pc + 2)
+        except ValueError:
+            return None
+        if step.opcode not in (0x05, 0x0d) or branch.opcode != 0x20 or branch.operand != pc:
+            return None
+        use_b = step.opcode == 0x05
+        count = state.b if use_b else state.c
+        original = join_word(*state.hl)
+        if original is None:
+            return None
+        if count is None:
+            # An unknown byte counter still terminates within 256 iterations.
+            # Preserve every possible final pointer/memory state rather than
+            # following an abstract DEC(None) backedge indefinitely.
+            successors = []
+            for value in range(256):
+                concrete = replace(state, **{"b" if use_b else "c": value})
+                folded = self.fold_fill(concrete, instruction, stop_at)
+                if folded is None:
+                    return None
+                successors.extend(folded[0])
+            return tuple(successors), ((pc + 1, step), (pc + 2, branch))
+        count = count or 256
+        if 0xe000 <= original < 0xfe00 and count > 0xfe00 - original:
+            return None
+        address = ram_address(original)
+        memory, vram = state.memory, state.vram
+        if 0x8000 <= address and address + count <= 0xa000 and state.vbk is not None:
+            start = VRAM_BANKS_BASE + state.vbk * VRAM_SIZE + address - 0x8000
+            vram = replace_range(vram, start, start + count, (state.a,) * count)
+        else:
+            if 0xc000 <= address < 0xe000 and count <= 0x1000 - (address & 0xfff):
+                if address >= 0xd000 and state.svbk is None:
+                    return None
+                start = self.wram_bank_address(state.svbk, address) if address >= 0xd000 else address
+            elif 0xff80 <= address and address + count <= 0xffff:
+                start = address
+            else:
+                return None
+            if state.stack and (state.sp is None or any(
+                    address <= ram_address((state.sp + i) & 0xffff) < address + count
+                    for i in range(len(state.stack)))):
+                return None
+            memory = replace_range(memory, start, start + count, (state.a,) * count)
+        successor = replace(state, pc=pc + 4, hl=word_bytes((original + count) & 0xffff),
+                            b=0 if use_b else state.b, c=state.c if use_b else 0,
+                            z=True, memory=memory, vram=vram)
+        return (successor,), ((pc + 1, step), (pc + 2, branch))
 
 
 def symbol(bank, pc):
@@ -1098,7 +1216,8 @@ def checked_helper_stubs(helpers):
             assembly.extend(["    ld (_gb_pc), de", "    push hl"])
         else:
             assembly.append("    ld (_gb_pc), hl")
-        assembly.append(f"    call _gb_{helper}")
+        fast = "fast_" if helper in ("load_hli", "load_hld", "store_hl", "store_hli", "store_hld") else ""
+        assembly.append(f"    call _gb_{fast}{helper}")
         if argument:
             assembly.append("    pop de")
         assembly.append("    jp .Lchecked_return")
@@ -1169,7 +1288,9 @@ def fixed_memory_access(data, instruction):
 
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
-                analysis_limit=DEFAULT_ANALYSIS_LIMIT):
+                analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None):
+    if continuous and not vblank_preview:
+        raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
                               0xc000 <= watch_address < 0xe000 or
                               0xff80 <= watch_address <= 0xfffe):
@@ -1180,17 +1301,33 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     instructions = cartridge.discover(extra_entries, stop_at, rom_bytes, timing=timing,
                                       trap_unsupported=trap_unsupported, vblank_preview=vblank_preview,
                                       dispatch_targets=dispatch_targets, input_after=input_after,
-                                      analysis_limit=analysis_limit)
+                                      analysis_limit=analysis_limit, progress=progress, merge_frames=continuous)
     assembly = ["    .assume ADL=1", "    .section .text"]
     targets = ['#include "runtime.h"', ""]
     fallback_addresses = set()
     helpers = set()
     repeated = {}
     ordered = sorted(instructions.items())
+    fill_loops = {}
+    if not timing:
+        for (bank, pc), instruction in ordered:
+            step = instructions.get((bank, pc + 1))
+            branch = instructions.get((bank, pc + 2))
+            if (pc not in cartridge.ram_code and instruction.opcode == 0x22 and step is not None
+                    and step.opcode in (0x05, 0x0d) and branch is not None
+                    and branch.opcode == 0x20 and branch.operand == pc
+                    and native_destination(bank, pc, pc + 4, instructions) is not None):
+                fill_loops[bank, pc] = int(step.opcode == 0x05)
     for (bank, pc), instruction in ordered:
         name = symbol(bank, pc)
         targets.append(f"extern void {name}(void);")
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
+        if (bank, pc) in fill_loops:
+            assembly.extend([
+                f"    ld hl, {fill_loops[bank, pc]}", "    push hl", "    call _gb_fill_hl",
+                "    pop de", "    or a, a", f"    jp nz, _{symbol(bank, pc + 4)}",
+                f".Lfill_slow_{bank:03x}_{pc:04x}:",
+            ])
         opcode = instruction.opcode
         in_ram = pc in cartridge.ram_code
         fixed = None if in_ram else fixed_memory_access(data, instruction)
@@ -1222,6 +1359,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 assembly.extend([f"    ld a, (_gb_hram+{pc - HRAM_BASE + index})",
                                  f"    cp a, 0x{byte:02x}", "    jp nz, _gb_unmapped"])
         native = None if timing else direct_branch(bank, pc, instruction, instructions)
+        if native is not None and (bank, pc - 2) in fill_loops:
+            native = [line.replace(f"_{symbol(bank, pc - 2)}", f".Lfill_slow_{bank:03x}_{pc - 2:04x}")
+                      for line in native]
         if native is not None:
             assembly.extend(f"    {line}" for line in native)
             continue
@@ -1304,7 +1444,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         f"const uint8_t rom_mbc5 = {int(cartridge.mbc5)};",
         f"const uint8_t rom_cgb = {int(cartridge.cgb)};",
         f"const uint8_t rom_timing = {int(timing)};",
-        f"const unsigned rom_preview_frames = {int(vblank_preview)};",
+        f"const unsigned rom_preview_frames = {0 if continuous else int(vblank_preview)};",
         f"const uint8_t rom_ram_size_code = {data[0x149]};",
         "", "const GbRomSpan gb_rom_spans[] = {", *(data_entries or ["    {0, 0, 0, 0},"]), "};",
         f"const unsigned gb_rom_span_count = {len(data_entries)};",

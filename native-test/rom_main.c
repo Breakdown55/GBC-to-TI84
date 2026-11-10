@@ -3,6 +3,10 @@
 #include "show_hex.h"
 #include "timing.h"
 
+#ifndef GB_FRAME_SKIP
+#define GB_FRAME_SKIP 0
+#endif
+
 #include <ti/getcsc.h>
 #if GB_LIVE
 #include <keypadc.h>
@@ -52,6 +56,18 @@ void gb_user_exit(void)
 }
 
 #if GB_LIVE
+static unsigned presentation_delay;
+
+static void present_live_frame(void)
+{
+    if (presentation_delay) {
+        --presentation_delay;
+    } else {
+        gb_present_frame();
+        presentation_delay = GB_FRAME_SKIP;
+    }
+}
+
 static void poll_buttons(void)
 {
     kb_SetMode(MODE_2_SINGLE);
@@ -80,7 +96,7 @@ static void live_frame(void)
 {
     poll_buttons();
     if (!gb_host_quit) {
-        gb_present_frame();
+        present_live_frame();
     }
 }
 #endif
@@ -114,9 +130,9 @@ uint8_t gb_preview_finish(void)
     }
     preview_in_handler = 0;
 #if GB_LIVE
-    gb_present_frame();
+    present_live_frame();
 #endif
-    return --preview_frames_left == 0;
+    return preview_frames_left && --preview_frames_left == 0;
 }
 
 int main(void)
