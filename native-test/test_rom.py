@@ -183,6 +183,18 @@ def tilemap_rom():
 
 
 class RomTest(unittest.TestCase):
+    def test_explicit_data_ranges_keep_bank_zero_windows_separate(self):
+        data = cartridge_image()
+        data[0x100] = 0x76  # HALT without reading ROM data.
+        data[0x3fff] = 0x12
+        data[0] = 0x34
+        _, table = compile_rom(data, rom_data=[(0, 0x3fff, 1), (0, 0x4000, 1)])
+        self.assertIn("{0x000, 0x3fff, 0x0001, 0x000000}", table)
+        self.assertIn("{0x000, 0x4000, 0x0001, 0x000001}", table)
+        self.assertIn("0x12, 0x34,", table)
+        with self.assertRaisesRegex(ValueError, "fit in one cartridge ROM window"):
+            compile_rom(data, rom_data=[(0, 0x3fff, 2)])
+
     def test_frame_join_keeps_banking_stack_and_sram_distinct(self):
         from dataclasses import replace
         from rom import State, KnownMemory, merge_frame_states, SRAM_BASE
@@ -401,7 +413,7 @@ class RomTest(unittest.TestCase):
         data = cartridge_image()
         data[0x100:0x107] = bytes.fromhex("01 a0 fe 0a 0a 0a 76")
         assembly, _ = compile_rom(data, stop_at=(0, 0x106), vblank_preview=1)
-        self.assertIn("jp nz, .Lshared_fault", assembly)
+        self.assertIn("jp c, .Lshared_fault", assembly)
         self.assertIn(".Lshared_fault:\n    pop de\n    jp _gb_unmapped", assembly)
 
     def test_rom_spans_keep_small_gaps_as_cartridge_bytes(self):

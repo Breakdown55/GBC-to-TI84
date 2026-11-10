@@ -34,6 +34,48 @@ _gb_fast_\name:
     fast_hl store_hli, store_hli, 1, 1
     fast_hl store_hld, store_hld, 1, -1
 
+/* The translated code passes the guest address in HL and the store value in A.
+ * Preserve the address only until we know whether the bus handler is needed. */
+    .global _gb_read_indirect
+_gb_read_indirect:
+    push hl
+    call .Lplain_ram
+    pop bc
+    jr c, .Lread_bus
+    ld a, (hl)
+    ret
+.Lread_bus:
+    push bc
+    call _gb_read_byte
+    pop bc
+    ld a, h
+    neg                 ; Carry indicates the 0x100 unmapped sentinel.
+    ld a, l
+    ret
+
+    .global _gb_write_indirect
+_gb_write_indirect:
+    ld c, a
+    push hl
+    call .Lplain_ram
+    jr c, .Lwrite_bus
+    pop de
+    ld (hl), c
+    ld a, 1
+    or a, a
+    ret
+.Lwrite_bus:
+    pop hl
+    ld de, 0
+    ld e, c
+    push de
+    push hl
+    call _gb_write_byte
+    pop bc
+    pop bc
+    or a, a
+    ret
+
 /* Only plain WRAM, its echo, and HRAM bypass the general memory bus.
  * VRAM, OAM, ROM, cartridge RAM, and MMIO retain their existing side effects. */
 .Lplain_ram:

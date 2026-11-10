@@ -1288,7 +1288,7 @@ def fixed_memory_access(data, instruction):
 
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
-                analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None):
+                analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=()):
     if continuous and not vblank_preview:
         raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
@@ -1297,6 +1297,12 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         raise ValueError("watch address must be in VRAM, WRAM or HRAM")
     cartridge = Cartridge(data, ram_code)
     rom_bytes = set()
+    for bank, address, length in rom_data:
+        if (not 0 <= bank <= cartridge.bank_mask or not 0 <= address < 2 * BANK_SIZE
+                or (address < BANK_SIZE and bank) or length <= 0
+                or address + length > (address // BANK_SIZE + 1) * BANK_SIZE):
+            raise ValueError("ROM data range must fit in one cartridge ROM window")
+        rom_bytes.update((bank, byte) for byte in range(address, address + length))
     dispatch_targets = set() if vblank_preview else None
     instructions = cartridge.discover(extra_entries, stop_at, rom_bytes, timing=timing,
                                       trap_unsupported=trap_unsupported, vblank_preview=vblank_preview,
@@ -1415,7 +1421,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     payload = bytearray()
     for bank, address in sorted(rom_bytes):
         offset = bank * BANK_SIZE + address % BANK_SIZE
-        if spans and spans[-1][0] == bank:
+        if spans and spans[-1][0] == bank and spans[-1][1] // BANK_SIZE == address // BANK_SIZE:
             span = spans[-1]
             gap = address - (span[1] + span[2])
             # A span record takes nine bytes, so small gaps cost less as ROM data.

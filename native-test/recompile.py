@@ -169,6 +169,11 @@ def parse_ram_code(text):
         raise argparse.ArgumentTypeError("expected hexadecimal START:BANK:SOURCE:LENGTH")
     return tuple(int(part, 16) for part in text.split(":"))
 
+def parse_rom_data(text):
+    if not re.fullmatch(r"[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}", text):
+        raise argparse.ArgumentTypeError("expected hexadecimal BANK:ADDRESS:LENGTH")
+    return tuple(int(part, 16) for part in text.split(":"))
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -202,6 +207,8 @@ def main():
     parser.add_argument("--analysis-progress", action="store_true", help="report static discovery progress")
     parser.add_argument("--archive-rom", action="store_true",
                         help="also package the full cartridge as archived AppVars for data reads beyond traced spans")
+    parser.add_argument("--rom-data", type=parse_rom_data, action="append", default=[],
+                        help="retain a ROM data range in the program, as BANK:ADDRESS:LENGTH in hex")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
@@ -238,7 +245,8 @@ def main():
                                       ram_code=args.ram_code, vblank_preview=preview_frames,
                                       input_after=input_after, analysis_limit=args.analysis_limit,
                                       continuous=args.vblank_run,
-                                      progress=progress if args.analysis_progress else None)
+                                      progress=progress if args.analysis_progress else None,
+                                      rom_data=args.rom_data)
         if args.archive_rom:
             table += storage_metadata(cartridge_data)
         ce = toolchain_path(args.cedev)

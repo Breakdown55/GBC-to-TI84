@@ -44,17 +44,15 @@ def flag_bit(condition):
     return 7 if condition.endswith("z") else 4
 
 
-def read_hl_byte():
+def read_indirect_byte(pair="hl"):
     return [
-        "ld hl, (_gb_hl)", "push hl", "call _gb_read_byte", "pop bc",
-        "ld a, h", "or a, a", "jp nz, _gb_unmapped", "ld a, l",
+        f"ld hl, (_gb_{pair})", "call _gb_read_indirect", "jp c, _gb_unmapped",
     ]
 
 
-def write_hl_byte():
+def write_indirect_byte(pair="hl"):
     return [
-        "ld hl, 0", "ld l, a", "push hl", "ld hl, (_gb_hl)", "push hl",
-        "call _gb_write_byte", "pop bc", "pop bc", *FAULT_IF_ZERO,
+        f"ld hl, (_gb_{pair})", "call _gb_write_indirect", "jp z, _gb_unmapped",
     ]
 
 
@@ -169,9 +167,9 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
     bit_op = re.fullmatch(r"(bit|res|set)\s+([0-7])\s*,\s*([abcdehl]|\[hl\])", normalized)
     if bit_op:
         operation, bit, register = bit_op.groups()
-        load = read_hl_byte() if register == "[hl]" else [f"ld a, ({BYTE_REGISTERS[register]})"]
+        load = read_indirect_byte() if register == "[hl]" else [f"ld a, ({BYTE_REGISTERS[register]})"]
         if operation != "bit":
-            store = write_hl_byte() if register == "[hl]" else [f"ld ({BYTE_REGISTERS[register]}), a"]
+            store = write_indirect_byte() if register == "[hl]" else [f"ld ({BYTE_REGISTERS[register]}), a"]
             return [*load, f"{operation} {bit}, a", *store], 2
         return [
             *load, f"bit {bit}, a",
@@ -182,8 +180,8 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
     shift = re.fullmatch(r"(rlc|rrc|rl|rr|sla|sra|swap|srl)\s+([abcdehl]|\[hl\])", normalized)
     if shift:
         operation, register = shift.groups()
-        load = read_hl_byte() if register == "[hl]" else [f"ld a, ({BYTE_REGISTERS[register]})"]
-        store = write_hl_byte() if register == "[hl]" else [f"ld ({BYTE_REGISTERS[register]}), a"]
+        load = read_indirect_byte() if register == "[hl]" else [f"ld a, ({BYTE_REGISTERS[register]})"]
+        store = write_indirect_byte() if register == "[hl]" else [f"ld ({BYTE_REGISTERS[register]}), a"]
         carry = []
         if operation in ("rl", "rr"):
             carry = ["ld c, a", "ld a, (_gb_f)", "and a, 0x10", "add a, 0xf0", "ld a, c"]
@@ -240,22 +238,18 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
     register_load = re.fullmatch(r"ld\s+([abcdehl])\s*,\s*\[(hl|de|bc)\]", normalized)
     if register_load:
         return [
-            f"ld hl, (_gb_{register_load[2]})", "push hl", "call _gb_read_byte", "pop bc",
-            "ld a, h", "or a, a", "jp nz, _gb_unmapped",
-            "ld a, l", f"ld ({BYTE_REGISTERS[register_load[1]]}), a",
+            *read_indirect_byte(register_load[2]),
+            f"ld ({BYTE_REGISTERS[register_load[1]]}), a",
         ], 1
     register_store = re.fullmatch(r"ld\s+\[(hl|de|bc)\]\s*,\s*([abcdehl])", normalized)
     if register_store:
         return [
-            "ld hl, 0", f"ld a, ({BYTE_REGISTERS[register_store[2]]})", "ld l, a", "push hl",
-            f"ld hl, (_gb_{register_store[1]})", "push hl", "call _gb_write_byte", "pop bc",
-            "pop bc", *FAULT_IF_ZERO,
+            f"ld a, ({BYTE_REGISTERS[register_store[2]]})", *write_indirect_byte(register_store[1]),
         ], 1
     immediate_store = re.fullmatch(r"ld\s+\[hl\]\s*,\s*\$([0-9a-f]{1,2})", normalized)
     if immediate_store:
         return [
-            f"ld hl, 0x{int(immediate_store[1], 16):02x}", "push hl",
-            "ld hl, (_gb_hl)", "push hl", "call _gb_write_byte", "pop bc", "pop bc", *FAULT_IF_ZERO,
+            f"ld a, 0x{int(immediate_store[1], 16):02x}", *write_indirect_byte(),
         ], 2
     direct_load = re.fullmatch(r"ld\s+a\s*,\s*\[\$([0-9a-f]{1,4})\]", normalized)
     if direct_load:
