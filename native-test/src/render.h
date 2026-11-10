@@ -26,6 +26,11 @@ static inline void gb_video_store(uint8_t *byte, uint8_t value)
     gb_video_store_dirty(byte, value, &gb_video_dirty);
 }
 
+static inline void gb_oam_store(unsigned offset, uint8_t value)
+{
+    gb_video_store_dirty(&gb_oam[offset], value, &gb_oam_dirty);
+}
+
 void gb_video_init(void);
 uint8_t gb_video_read(uint8_t offset);
 void gb_video_write(uint8_t offset, uint8_t value);

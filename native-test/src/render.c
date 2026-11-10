@@ -30,6 +30,7 @@ void gb_video_init(void)
     bgp = 0xfc;
     obp0 = obp1 = 0xff;
     obj_x_priority = 0;
+    gb_video_dirty = 1;
 }
 
 uint8_t gb_video_read(uint8_t offset)
@@ -106,6 +107,7 @@ static uint16_t obj_colors[8][4];
 
 static void prepare_frame(void)
 {
+    /* Cached rows use the palette values from this presentation only. */
     for (unsigned i = 0; i < ROW_CACHE_SIZE; ++i) {
         row_cache[i].attributes = 0;
     }

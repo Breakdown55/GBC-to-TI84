@@ -26,6 +26,18 @@ Use `--stop-at BANK:ADDRESS` to stop before executing a reachable instruction. U
 
 `--vblank-preview [FRAMES]` is a graphics diagnostic. It advances to VBlank when the guest waits at `HALT` and displays the result after the requested number of handlers return. For routines copied to high RAM, `--ram-code START:BANK:SOURCE:LENGTH` supplies the ROM bytes used to translate and validate the executable copy. All four fields are hexadecimal.
 
+Renderer optimizations are automatic for every cartridge the compiler supports. The tile cache uses the guest's tile bytes, attributes, and current palettes. When only sprite memory changes, the renderer refreshes the rows covered by the old and new sprites. Changes to video RAM, palettes, or display registers trigger a full redraw.
+
+The compiler also packs nearby cartridge data ranges together and shares repeated native instruction sequences in VBlank preview builds. It makes those decisions from the input ROM and generated code.
+
+For a cartridge that waits at `HALT` for VBlank, build a live preview with:
+
+```sh
+python native-test/recompile.py input.gbc output.8xp --live --vblank-preview 60
+```
+
+Choose the frame limit and any `--entry` or `--ram-code` values for the ROM you are building. To compare speed across compiler revisions, use the same ROM, toolchain version, build options, and emulator speed for both builds. The gain depends on how often the cartridge changes its display state.
+
 Audio support is limited to register readback and power control.
 
 ## Regression test

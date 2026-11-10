@@ -368,7 +368,7 @@ static uint8_t transfer_oam(uint8_t page)
         bytes[i] = (uint8_t)value;
     }
     for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
-        gb_video_store_dirty(&gb_oam[i], bytes[i], &gb_oam_dirty);
+        gb_oam_store(i, bytes[i]);
     }
     gb_dma = page;
     return 1;
@@ -676,7 +676,7 @@ static uint8_t write_memory(uint24_t address, uint8_t value)
         if (address < 0xa000) {
             gb_video_store(byte, value);
         } else if (address >= 0xfe00 && address < 0xfe00 + GB_OAM_SIZE) {
-            gb_video_store_dirty(byte, value, &gb_oam_dirty);
+            gb_oam_store(address - 0xfe00, value);
         } else {
             *byte = value;
         }
