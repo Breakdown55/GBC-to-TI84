@@ -38,6 +38,8 @@ python native-test/recompile.py input.gbc output.8xp --live --vblank-preview 60
 
 Choose the frame limit and any `--entry` or `--ram-code` values for the ROM you are building. To compare speed across compiler revisions, use the same ROM, toolchain version, build options, and emulator speed for both builds. The gain depends on how often the cartridge changes its display state.
 
+The performance target is 30 displayed frames per second during active gameplay on a TI-84 Plus CE. That gives the translated game code and renderer about 33.3 ms per displayed frame. The target assumes real-time guest execution with game timing and input sampling independent of display updates.
+
 Audio support is limited to register readback and power control.
 
 ## Regression test
