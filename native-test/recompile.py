@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 from rom import DEFAULT_ANALYSIS_LIMIT, compile_rom
-from rom_storage import cartridge_chunks, storage_metadata, CHUNK_SIZE
+from rom_storage import cartridge_chunks, storage_metadata, BANK_CHUNK_SIZE, CHUNK_SIZE
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -73,7 +73,8 @@ def guard_compressed_program(run, work):
     path.write_bytes(program)
 
 
-def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, archive_size=0):
+def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, archive_size=0,
+          archive_banks=False):
     def run(tool, *args):
         subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
 
@@ -87,6 +88,7 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
         )
     ]
     objects = []
+    chunk_size = BANK_CHUNK_SIZE if archive_banks else CHUNK_SIZE
     sources = (
         ("rom_main", PROJECT / "rom_main.c"),
         ("runtime", PROJECT / "src/runtime.c"),
@@ -102,8 +104,8 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
             "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}",
             f"-DGB_LIVE={int(input_after is not None)}", f"-DGB_INPUT_AFTER={input_after or 0}", "-nostdinc",
             f"-DGB_FRAME_SKIP={frame_skip}",
-            f"-DGB_ROM_CHUNKS={(archive_size + CHUNK_SIZE - 1) // CHUNK_SIZE}", f"-DGB_ROM_SIZE={archive_size}",
-            f"-DGB_ROM_CHUNK_SIZE={CHUNK_SIZE}",
+            f"-DGB_ROM_CHUNKS={(archive_size + chunk_size - 1) // chunk_size}", f"-DGB_ROM_SIZE={archive_size}",
+            f"-DGB_ROM_CHUNK_SIZE={chunk_size}", f"-DGB_ARCHIVE_BANKS={int(archive_banks)}",
             "-isystem", ce / "include", "-I", PROJECT / "src",
             source, "-o", f"{unit}.s")
         run(assembler, "-march=ez80+full", f"{unit}.s", "-o", f"{unit}.o")
@@ -205,8 +207,11 @@ def main():
     parser.add_argument("--analysis-limit", type=int, default=DEFAULT_ANALYSIS_LIMIT,
                         help="maximum number of analysis states (default: %(default)s)")
     parser.add_argument("--analysis-progress", action="store_true", help="report static discovery progress")
-    parser.add_argument("--archive-rom", action="store_true",
-                        help="also package the full cartridge as archived AppVars for data reads beyond traced spans")
+    archive = parser.add_mutually_exclusive_group()
+    archive.add_argument("--archive-rom", action="store_true",
+                         help="package the full cartridge as archived AppVars")
+    archive.add_argument("--archive-bank", action="append", type=lambda value: int(value, 16), metavar="BANK",
+                         help="package one hexadecimal ROM bank as an archived AppVar; repeat for more banks")
     parser.add_argument("--rom-data", type=parse_rom_data, action="append", default=[],
                         help="retain a ROM data range in the program, as BANK:ADDRESS:LENGTH in hex")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
@@ -240,6 +245,11 @@ def main():
         print(f"Analysis: {states:,} states, {instructions:,} instructions, {frames} VBlanks", flush=True)
     try:
         cartridge_data = args.rom.read_bytes()
+        archive_banks = set(args.archive_bank) if args.archive_bank else None
+        if archive_banks is not None and any(not 0 <= bank < len(cartridge_data) // BANK_CHUNK_SIZE
+                                             for bank in archive_banks):
+            raise ValueError("archive bank is outside the cartridge ROM")
+        use_archive = args.archive_rom or archive_banks is not None
         assembly, table = compile_rom(cartridge_data, args.entry, args.watch or 0, args.stop_at,
                                       timing=timing, trap_unsupported=args.trap_unsupported,
                                       ram_code=args.ram_code, vblank_preview=preview_frames,
@@ -247,8 +257,8 @@ def main():
                                       continuous=args.vblank_run,
                                       progress=progress if args.analysis_progress else None,
                                       rom_data=args.rom_data)
-        if args.archive_rom:
-            table += storage_metadata(cartridge_data)
+        if use_archive:
+            table += storage_metadata(cartridge_data, archive_banks)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:
@@ -256,11 +266,11 @@ def main():
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
             archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after, args.frame_skip,
-                             len(cartridge_data) if args.archive_rom else 0)
-            if args.archive_rom:
+                             len(cartridge_data) if use_archive else 0, archive_banks is not None)
+            if use_archive:
                 directory = output.parent / f"{args.name}-data"
                 directory.mkdir(exist_ok=True)
-                for name, contents in cartridge_chunks(cartridge_data):
+                for name, contents in cartridge_chunks(cartridge_data, archive_banks):
                     staged = work / f"{name}.8xv"
                     staged.write_bytes(contents)
                     os.replace(staged, directory / staged.name)
@@ -270,7 +280,7 @@ def main():
         parser.exit(1, f"{error}\n")
     print(output)
     print(f"Transfer destination: {'Archive' if archived else 'RAM'}")
-    if args.archive_rom:
+    if use_archive:
         print(f"Send every .8xv in {directory} to Archive before running.")
 
 

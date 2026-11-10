@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-from rom_storage import CHUNK_SIZE, cartridge_chunks, storage_metadata
+from rom_storage import BANK_CHUNK_SIZE, CHUNK_SIZE, cartridge_chunks, storage_metadata
 
 
 class RomStorageTest(unittest.TestCase):
@@ -64,6 +64,16 @@ class RomStorageTest(unittest.TestCase):
         self.assertIn('"' + name[:5] + '"', metadata)
         self.assertIn(','.join(map(str, hashlib.sha256(data).digest())), metadata)
         self.assertEqual(list(cartridge_chunks(data)), list(cartridge_chunks(data)))
+
+    def test_selected_banks_keep_their_original_indices(self):
+        data = b"".join(bytes([bank]) * BANK_CHUNK_SIZE for bank in range(8))
+        chunks = list(cartridge_chunks(data, {2, 5}))
+        self.assertEqual([name[5:] for name, _ in chunks], ["002", "005"])
+        for (name, file), bank in zip(chunks, (2, 5)):
+            self.assertTrue(name.startswith("B"))
+            self.assertEqual(struct.unpack_from("<HH", file, 74 + 36), (bank, BANK_CHUNK_SIZE))
+            self.assertEqual(file[74 + 40:-2], bytes([bank]) * BANK_CHUNK_SIZE)
+        self.assertIn("gb_archive_banks[] = {36};", storage_metadata(data, {2, 5}))
 
 
 if __name__ == "__main__":

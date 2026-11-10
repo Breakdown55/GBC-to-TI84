@@ -6,6 +6,9 @@
 
 extern const char gb_archive_prefix[];
 extern const uint8_t gb_archive_digest[32];
+#if GB_ARCHIVE_BANKS
+extern const uint8_t gb_archive_banks[];
+#endif
 char gb_archive_name[9];
 static const uint8_t *chunks[GB_ROM_CHUNKS];
 
@@ -15,6 +18,9 @@ uint8_t gb_archive_init(void)
     memcpy(gb_archive_name, gb_archive_prefix, 5);
     gb_archive_name[8] = 0;
     for (unsigned i = 0; i < GB_ROM_CHUNKS; ++i) {
+#if GB_ARCHIVE_BANKS
+        if (!(gb_archive_banks[i / 8] & (1 << (i & 7)))) continue;
+#endif
         gb_archive_name[5] = hex[(i >> 8) & 15];
         gb_archive_name[6] = hex[(i >> 4) & 15];
         gb_archive_name[7] = hex[i & 15];
@@ -40,6 +46,9 @@ const uint8_t *gb_archive_pointer(uint16_t address, unsigned length)
     if (linear >= GB_ROM_SIZE || length > GB_ROM_SIZE - linear) return 0;
     unsigned chunk = linear / GB_ROM_CHUNK_SIZE;
     unsigned offset = linear - chunk * GB_ROM_CHUNK_SIZE;
+#if GB_ARCHIVE_BANKS
+    if (!chunks[chunk]) return 0;
+#endif
     if (length > GB_ROM_CHUNK_SIZE - offset) return 0;
     return chunks[chunk] + offset;
 }

@@ -34,6 +34,8 @@ For continuous HALT-driven execution, use `--live --vblank-run`. It has no runti
 
 For a smaller standalone build, repeat `--rom-data BANK:ADDRESS:LENGTH` to embed particular hexadecimal ROM ranges alongside discovered data. Each range must fit within a single 16 KiB ROM window.
 
+To keep larger data ranges in Archive, repeat `--archive-bank BANK` with the hexadecimal bank numbers. Transfer the generated bank AppVars to **Archive**. Reads outside embedded data and the selected banks can still fault.
+
 Renderer optimizations are automatic for every cartridge the compiler supports. The calculator displays 8-bit palette indices, so palette changes can update colors without redrawing pixels. A decoded-tile cache covers both video RAM banks, and a retained background layer avoids rebuilding the background beneath moving sprites. Background updates resolve map entries once per tile rectangle. CPU stores and DMA transfers invalidate the affected tiles and map cells. Changes to scrolling or display layout rebuild the background. Sprite composition preserves transparency, priority, flips, and the ten-sprites-per-scanline limit.
 
 The graphics buffers occupy the unused 76,800-byte half of LCD memory while the indexed display is active. During a background rebuild, the renderer also reuses tiles with their palette, priority, and horizontal flip already applied. Video remains frame-based, so mid-frame effects have limited accuracy.
