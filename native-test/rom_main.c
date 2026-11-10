@@ -69,13 +69,26 @@ static void present_live_frame(void)
     }
 }
 
-static void poll_buttons(void)
+static bool scan_keypad(void)
 {
     kb_SetMode(MODE_2_SINGLE);
     unsigned spins = 65535;
     while (kb_GetMode() != MODE_0_IDLE && --spins) {
     }
-    if (!spins) {
+    return spins != 0;
+}
+
+static bool keypad_pressed(void)
+{
+    for (unsigned row = 1; row <= 7; ++row) {
+        if (kb_Data[row]) return true;
+    }
+    return false;
+}
+
+static void poll_buttons(void)
+{
+    if (!scan_keypad()) {
         return;
     }
     gb_host_quit = kb_IsDown(kb_KeyClear) != 0;
@@ -232,7 +245,15 @@ int main(void)
         os_NewLine();
     }
     os_PutStrFull("Press a key");
+#if GB_LIVE
+    /* A guest button may still be held when the diagnostic is displayed. */
+    while (!scan_keypad() || keypad_pressed()) {
+    }
+    while (!scan_keypad() || !keypad_pressed()) {
+    }
+#else
     while (!os_GetCSC()) {
     }
+#endif
     return status == RUN_HALTED || status == RUN_CHECKPOINT ? 0 : 1;
 }
