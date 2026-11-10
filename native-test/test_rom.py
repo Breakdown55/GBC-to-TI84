@@ -184,6 +184,19 @@ def tilemap_rom():
 
 
 class RomTest(unittest.TestCase):
+    def test_offloading_keeps_explicit_rom_data_and_native_code(self):
+        data = cartridge_image()
+        data[0x100:0x107] = bytes.fromhex("fa 00 41 fa 10 41 76")
+        data[0x4100] = 0x12
+        data[0x4110] = 0x34
+        ranges = [(1, 0x4110, 1)]
+        assembly, table = compile_rom(data, rom_data=ranges)
+        offloaded, smaller = compile_rom(data, rom_data=ranges, offload_banks={1})
+        self.assertEqual(assembly, offloaded)
+        self.assertIn("{0x001, 0x4100, 0x0001", table)
+        self.assertNotIn("{0x001, 0x4100,", smaller)
+        self.assertIn("{0x001, 0x4110, 0x0001", smaller)
+
     def test_explicit_data_ranges_keep_bank_zero_windows_separate(self):
         data = cartridge_image()
         data[0x100] = 0x76  # HALT without reading ROM data.

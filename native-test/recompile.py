@@ -212,6 +212,8 @@ def main():
                          help="package the full cartridge as archived AppVars")
     archive.add_argument("--archive-bank", action="append", type=lambda value: int(value, 16), metavar="BANK",
                          help="package one hexadecimal ROM bank as an archived AppVar; repeat for more banks")
+    parser.add_argument("--offload-bank", action="append", default=[], type=lambda value: int(value, 16),
+                        metavar="BANK", help="keep discovered data for an archived bank out of the native program")
     parser.add_argument("--rom-data", type=parse_rom_data, action="append", default=[],
                         help="retain a ROM data range in the program, as BANK:ADDRESS:LENGTH in hex")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
@@ -250,13 +252,17 @@ def main():
                                              for bank in archive_banks):
             raise ValueError("archive bank is outside the cartridge ROM")
         use_archive = args.archive_rom or archive_banks is not None
+        offload_banks = set(args.offload_bank)
+        backed_banks = range(len(cartridge_data) // BANK_CHUNK_SIZE) if args.archive_rom else archive_banks or set()
+        if not offload_banks.issubset(backed_banks):
+            raise ValueError("--offload-bank requires the same bank in --archive-bank or --archive-rom")
         assembly, table = compile_rom(cartridge_data, args.entry, args.watch or 0, args.stop_at,
                                       timing=timing, trap_unsupported=args.trap_unsupported,
                                       ram_code=args.ram_code, vblank_preview=preview_frames,
                                       input_after=input_after, analysis_limit=args.analysis_limit,
                                       continuous=args.vblank_run,
                                       progress=progress if args.analysis_progress else None,
-                                      rom_data=args.rom_data)
+                                      rom_data=args.rom_data, offload_banks=offload_banks)
         if use_archive:
             table += storage_metadata(cartridge_data, archive_banks)
         ce = toolchain_path(args.cedev)

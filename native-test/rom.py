@@ -1408,7 +1408,7 @@ def lcd_poll_rule(bank, pc, instructions, ram_code):
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
                 analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=(),
-                predict_returns=True):
+                predict_returns=True, offload_banks=()):
     if continuous and not vblank_preview:
         raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
@@ -1424,10 +1424,14 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             raise ValueError("ROM data range must fit in one cartridge ROM window")
         rom_bytes.update((bank, byte) for byte in range(address, address + length))
     dispatch_targets = set() if vblank_preview else None
+    retained = rom_bytes.copy() if offload_banks else None
     instructions = cartridge.discover(extra_entries, stop_at, rom_bytes, timing=timing,
                                       trap_unsupported=trap_unsupported, vblank_preview=vblank_preview,
                                       dispatch_targets=dispatch_targets, input_after=input_after,
                                       analysis_limit=analysis_limit, progress=progress, merge_frames=continuous)
+    if retained is not None:
+        retained.update(location for location in rom_bytes if location[0] not in offload_banks)
+        rom_bytes = retained
     assembly = ["    .assume ADL=1", "    .section .text"]
     targets = ['#include "runtime.h"', ""]
     fallback_addresses = set()
