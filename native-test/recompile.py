@@ -25,7 +25,7 @@ def toolchain_path(explicit):
     return Path(prefix).resolve()
 
 
-def build(ce, work, name):
+def build(ce, work, name, show_frame=False):
     def run(tool, *args):
         subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
 
@@ -42,12 +42,16 @@ def build(ce, work, name):
     sources = (
         ("rom_main", PROJECT / "rom_main.c"),
         ("runtime", PROJECT / "src/runtime.c"),
+        ("timing", PROJECT / "src/timing.c"),
+        ("render", PROJECT / "src/render.c"),
+        ("vram_dma", PROJECT / "src/vram_dma.c"),
         ("targets", work / "targets.c"),
     )
     for unit, source in sources:
         run(clang, "-S", "-Oz", "-Wall", "-Wextra", "-fno-addrsig",
             "-ffunction-sections", "-fdata-sections", "-mllvm", "-z80-gas-style",
-            "-D__TICE__=1", "-nostdinc", "-isystem", ce / "include", "-I", PROJECT / "src",
+            "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}", "-nostdinc",
+            "-isystem", ce / "include", "-I", PROJECT / "src",
             source, "-o", f"{unit}.s")
         run(assembler, "-march=ez80+full", f"{unit}.s", "-o", f"{unit}.o")
         objects.append(f"{unit}.o")
@@ -71,13 +75,27 @@ def build(ce, work, name):
         "-T", ce / "meta/linker_script.ld", "-Map=program.map", "program.o", "crt0.o",
         "--start-group", lib / "libc/allocator_standard.a", *core_libs,
         "--end-group", "-o", "program.obj")
-    run("bin/convbin", "-k", "8xp", "-u", "-n", name, "-j", "elf", "-i", "program.obj",
-        "-o", "program.8xp")
+    convert_args = ("-u", "-n", name, "-j", "elf", "-i", "program.obj", "-o", "program.8xp")
+    run("bin/convbin", "-k", "8xp", *convert_args)
+    parts = list(work.glob("program.8xp.*.8xv"))
+    if parts:
+        # The split launcher depends on companion AppVars. Try a single compressed program.
+        for part in parts:
+            part.unlink()
+        run("bin/convbin", "-k", "8xp-compressed", "-e", "zx7", *convert_args)
+        if any(work.glob("program.8xp.*.8xv")):
+            raise ValueError("generated program exceeds the single-file TI program limit")
 
 
 def parse_entry(text):
     if not re.fullmatch(r"[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,4}", text):
         raise argparse.ArgumentTypeError("expected a hexadecimal BANK:ADDRESS pair")
+    return tuple(int(part, 16) for part in text.split(":"))
+
+
+def parse_seed(text):
+    if not re.fullmatch(r"[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})?", text):
+        raise argparse.ArgumentTypeError("expected hexadecimal BANK:ADDRESS or BANK:ADDRESS:SP")
     return tuple(int(part, 16) for part in text.split(":"))
 
 
@@ -87,10 +105,14 @@ def main():
     parser.add_argument("output", type=Path, help="output .8xp path")
     parser.add_argument("--cedev", type=Path, help="path to the installed CEdev directory")
     parser.add_argument("--name", default="GBCRUN", help="calculator program name")
-    parser.add_argument("--entry", type=parse_entry, action="append", default=[],
-                        help="additional hexadecimal BANK:ADDRESS entry for dynamic targets")
+    parser.add_argument("--entry", type=parse_seed, action="append", default=[],
+                        help="additional hexadecimal BANK:ADDRESS[:SP] entry for dynamic targets")
     parser.add_argument("--stop-at", type=parse_entry,
                         help="stop before executing this hexadecimal BANK:ADDRESS")
+    parser.add_argument("--timing", action="store_true", help="enable guest timing and interrupts")
+    parser.add_argument("--frame", action="store_true", help="show the guest display on a normal stop")
+    parser.add_argument("--trap-unsupported", action="store_true",
+                        help="build with runtime faults for unsupported opcodes")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
@@ -102,14 +124,15 @@ def main():
     if args.watch == 0:
         parser.error("--watch must be a VRAM, WRAM, or HRAM address")
     try:
-        assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at)
+        assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at,
+                                      timing=args.timing, trap_unsupported=args.trap_unsupported)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:
             work = Path(directory)
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
-            build(ce, work, args.name)
+            build(ce, work, args.name, args.frame)
             os.replace(work / "program.8xp", output)
             os.replace(work / "program.map", output.with_suffix(".map"))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

@@ -1,5 +1,7 @@
 #include "runtime.h"
+#include "render.h"
 #include "show_hex.h"
+#include "timing.h"
 
 #include <ti/getcsc.h>
 
@@ -9,8 +11,11 @@ extern const uint16_t rom_bank_mask;
 extern const uint16_t rom_watch_address;
 extern const uint8_t rom_mbc5;
 extern const uint8_t rom_cgb;
-extern const GbRomByte gb_rom_bytes[];
-extern const unsigned gb_rom_byte_count;
+extern const uint8_t rom_timing;
+extern const uint8_t rom_ram_size_code;
+extern const GbRomSpan gb_rom_spans[];
+extern const uint8_t gb_rom_bytes[];
+extern const unsigned gb_rom_span_count;
 extern void gb_000_0100(void);
 
 volatile uint8_t gb_run_status;
@@ -37,12 +42,17 @@ void gb_checkpoint(void)
 
 int main(void)
 {
+    static const uint24_t ram_sizes[] = {0, 0x800, 0x2000, 0x8000, 0x20000, 0x10000};
     gb_rom_bank_mask = rom_bank_mask;
     gb_rom_bank = 1;
     gb_mbc5 = rom_mbc5;
+    if (gb_mbc5 && rom_ram_size_code < sizeof(ram_sizes) / sizeof(ram_sizes[0])) {
+        gb_sram_size = ram_sizes[rom_ram_size_code];
+    }
     gb_cgb = rom_cgb;
-    gb_rom_data = gb_rom_bytes;
-    gb_rom_data_count = gb_rom_byte_count;
+    gb_rom_data = gb_rom_spans;
+    gb_rom_payload = gb_rom_bytes;
+    gb_rom_data_count = gb_rom_span_count;
     gb_a = gb_cgb ? 0x11 : 0x01;
     gb_sp = 0xfffe;
     gb_lcdc = 0x91;
@@ -51,10 +61,28 @@ int main(void)
     gb_nr51 = 0xf3;
     gb_nr52 = 0x80;
     gb_pc = 0x0100;
+    gb_video_init();
+    gb_timing_enabled = rom_timing;
+    if (gb_timing_enabled) {
+        gb_timing_init();
+    }
     gb_000_0100();
+    if (gb_timing_enabled) {
+        gb_timing_flush();
+    }
 
     /* TI-OS display calls can reuse scratch RAM backing the guest state. */
     uint8_t status = gb_run_status;
+#if GB_SHOW_FRAME
+    if (status == RUN_HALTED || status == RUN_CHECKPOINT) {
+        gb_present_frame();
+        while (!os_GetCSC()) {
+        }
+        gb_end_frame();
+        os_ClrHome();
+        return 0;
+    }
+#endif
     uint16_t pc = gb_pc;
     uint16_t bank = pc < 0x4000 ? 0 : gb_rom_bank;
     uint16_t address = rom_watch_address;

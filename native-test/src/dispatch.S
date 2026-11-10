@@ -33,3 +33,42 @@ _gb_dispatch:
     sbc hl, de
     jp z, _gb_missing_target
     jp (hl)
+
+    .section .text.gb_timing_dispatch
+    .global _gb_boundary
+    .global _gb_reti
+    .global _gb_timed_halt
+
+_gb_boundary:
+    push de             ; Staged T-cycles, then guest PC.
+    push hl
+    call _gb_timing_boundary
+    pop de
+    pop de
+    ld a, l             ; Zero, fault (1), or a guest IRQ vector.
+    or a, a
+    ret z
+    pop de              ; Drop the translated instruction's boundary return.
+    dec a
+    jp z, _gb_unmapped
+    jp _gb_dispatch
+
+_gb_reti:
+    call _gb_timing_enable_ime
+    jp _gb_ret
+
+_gb_timed_halt:
+    push hl
+    call _gb_timing_halt
+    pop de              ; Resume PC if HALT woke without servicing an IRQ.
+    ld a, l
+    or a, a
+    jr z, .Lresume
+    dec a
+    jp z, _gb_unmapped
+    dec a
+    jp z, _gb_halt
+    jp _gb_dispatch
+.Lresume:
+    ex de, hl
+    jp _gb_dispatch

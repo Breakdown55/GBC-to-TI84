@@ -1,4 +1,7 @@
 #include "runtime.h"
+#include "render.h"
+#include "timing.h"
+#include "vram_dma.h"
 #include <stdbool.h>
 
 enum {
@@ -7,14 +10,29 @@ enum {
     GB_FLAG_H = 0x20,
     GB_FLAG_C = 0x10,
     GB_UNMAPPED_BYTE = 0x100,
+    SRAM_PAGE_SIZE = 64,
+    SRAM_PAGE_LIMIT = 96,
+    SRAM_PAGE_COUNT = 0x20000 / SRAM_PAGE_SIZE,
 };
 
-const GbRomByte *gb_rom_data;
+typedef struct {
+    uint16_t number;
+    uint8_t matches;
+    uint8_t bytes[SRAM_PAGE_SIZE];
+} SramPage;
+
+const GbRomSpan *gb_rom_data;
+const uint8_t *gb_rom_payload;
 unsigned gb_rom_data_count;
 volatile uint16_t gb_rom_bank;
 uint16_t gb_rom_bank_mask;
 uint8_t gb_mbc5;
 uint8_t gb_ram_enabled;
+uint24_t gb_sram_size;
+static uint8_t sram_bank;
+static uint8_t sram_page_count;
+static uint8_t sram_fill[SRAM_PAGE_COUNT]; /* Encoded so zero-initialized pages read as erased. */
+static SramPage sram_pages[SRAM_PAGE_LIMIT];
 uint8_t gb_cgb;
 volatile uint24_t gb_pc;
 volatile uint24_t gb_hl;
@@ -50,6 +68,9 @@ uint8_t gb_lyc;
 uint8_t gb_wy;
 uint8_t gb_wx;
 uint8_t gb_rp;
+static uint8_t gb_dma;
+
+static uint16_t read_memory(uint24_t address);
 
 static uint8_t subtraction_flags(uint8_t a, uint8_t value)
 {
@@ -82,16 +103,21 @@ void gb_srl_a(void)
 
 void gb_add_hl_de(void)
 {
+    gb_add_hl(gb_de);
+}
+
+void gb_add_hl(uint24_t value)
+{
     uint16_t hl = (uint16_t)gb_hl;
-    uint16_t de = (uint16_t)gb_de;
-    uint24_t sum = (uint24_t)hl + de;
+    uint16_t word = (uint16_t)value;
+    uint24_t sum = (uint24_t)hl + word;
     gb_f = (gb_f & GB_FLAG_Z) |
-           ((hl & 0x0fff) + (de & 0x0fff) > 0x0fff ? GB_FLAG_H : 0) |
+           ((hl & 0x0fff) + (word & 0x0fff) > 0x0fff ? GB_FLAG_H : 0) |
            (sum > 0xffff ? GB_FLAG_C : 0);
     gb_hl = (uint16_t)sum;
 }
 
-static uint8_t step_byte(uint8_t value, bool decrement)
+uint8_t gb_step_byte(uint8_t value, uint8_t decrement)
 {
     uint8_t result = decrement ? value - 1 : value + 1;
     gb_f = (gb_f & GB_FLAG_C) |
@@ -103,27 +129,103 @@ static uint8_t step_byte(uint8_t value, bool decrement)
 
 void gb_inc_a(void)
 {
-    gb_a = step_byte(gb_a, false);
+    gb_a = gb_step_byte(gb_a, 0);
 }
 
 void gb_dec_b(void)
 {
-    uint8_t result = step_byte((uint8_t)(gb_bc >> 8), true);
+    uint8_t result = gb_step_byte((uint8_t)(gb_bc >> 8), 1);
     gb_bc = ((uint16_t)result << 8) | (gb_bc & 0xff);
 }
 
 void gb_inc_c(void)
 {
-    gb_bc = (gb_bc & 0xff00) | step_byte((uint8_t)gb_bc, false);
+    gb_bc = (gb_bc & 0xff00) | gb_step_byte((uint8_t)gb_bc, 0);
 }
 
 void gb_dec_c(void)
 {
-    gb_bc = (gb_bc & 0xff00) | step_byte((uint8_t)gb_bc, true);
+    gb_bc = (gb_bc & 0xff00) | gb_step_byte((uint8_t)gb_bc, 1);
+}
+
+static uint16_t add_sp_offset(uint8_t offset)
+{
+    uint16_t sp = gb_sp;
+    gb_f = ((sp & 0x0f) + (offset & 0x0f) > 0x0f ? GB_FLAG_H : 0) |
+           ((sp & 0xff) + offset > 0xff ? GB_FLAG_C : 0);
+    return (uint16_t)(sp + (int8_t)offset);
+}
+
+void gb_ld_hl_sp(uint8_t offset)
+{
+    gb_hl = add_sp_offset(offset);
+}
+
+void gb_add_sp(uint8_t offset)
+{
+    gb_sp = add_sp_offset(offset);
+}
+
+void gb_alu(uint8_t operation, uint8_t operand)
+{
+    uint8_t a = gb_a;
+    uint8_t carry = (operation == 1 || operation == 3) && (gb_f & GB_FLAG_C);
+    uint8_t result, flags = 0;
+    switch (operation) {
+    case 0:
+    case 1: {
+        uint16_t sum = a + operand + carry;
+        result = (uint8_t)sum;
+        flags = (((a & 15) + (operand & 15) + carry > 15) ? GB_FLAG_H : 0) |
+                (sum > 255 ? GB_FLAG_C : 0);
+        break;
+    }
+    case 2:
+    case 3:
+    case 7:
+        result = a - operand - carry;
+        flags = GB_FLAG_N |
+                ((a & 15) < (operand & 15) + carry ? GB_FLAG_H : 0) |
+                (a < operand + carry ? GB_FLAG_C : 0);
+        break;
+    case 4:
+        result = a & operand;
+        flags = GB_FLAG_H;
+        break;
+    case 5:
+        result = a ^ operand;
+        break;
+    default:
+        result = a | operand;
+        break;
+    }
+    if (operation != 7) {
+        gb_a = result;
+    }
+    gb_f = flags | (result == 0 ? GB_FLAG_Z : 0);
+}
+
+uint8_t gb_alu_hl(uint8_t operation)
+{
+    uint16_t value = read_memory((uint16_t)gb_hl);
+    if (value == GB_UNMAPPED_BYTE) {
+        return 0;
+    }
+    gb_alu(operation, (uint8_t)value);
+    return 1;
+}
+
+static bool timed_register(uint8_t offset)
+{
+    return (offset >= 0x04 && offset <= 0x07) || offset == 0x40 ||
+           offset == 0x41 || offset == 0x44 || offset == 0x45;
 }
 
 static uint16_t read_high(uint8_t offset)
 {
+    if (gb_timing_enabled && timed_register(offset)) {
+        return gb_timing_read(offset);
+    }
     switch (offset) {
     case 0x00:
         return gb_joyp | 0xcf; /* Both button groups are released. */
@@ -161,6 +263,17 @@ static uint16_t read_high(uint8_t offset)
     }
     case 0x45:
         return gb_lyc;
+    case 0x46:
+        return gb_dma;
+    case 0x47:
+    case 0x48:
+    case 0x49:
+    case 0x68:
+    case 0x69:
+    case 0x6a:
+    case 0x6b:
+    case 0x6c:
+        return gb_video_read(offset);
     case 0x4a:
         return gb_wy;
     case 0x4b:
@@ -169,6 +282,12 @@ static uint16_t read_high(uint8_t offset)
         return gb_cgb ? gb_key1 | 0x7e : 0xff;
     case 0x4f:
         return gb_cgb ? gb_vbk | 0xfe : 0xff;
+    case 0x51:
+    case 0x52:
+    case 0x53:
+    case 0x54:
+    case 0x55:
+        return 0xff;
     case 0x56:
         return gb_cgb ? gb_rp | 0x3e : 0xff; /* No infrared input. */
     case 0x70:
@@ -193,8 +312,33 @@ uint8_t gb_read_high(uint8_t offset)
     return (uint8_t)value;
 }
 
+static uint8_t transfer_oam(uint8_t page)
+{
+    if (page >= 0xe0) {
+        return 0;
+    }
+    uint16_t source = (uint16_t)page << 8;
+    uint8_t bytes[GB_OAM_SIZE];
+    for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
+        uint16_t value = read_memory(source + i);
+        if (value == GB_UNMAPPED_BYTE) {
+            return 0;
+        }
+        bytes[i] = (uint8_t)value;
+    }
+    for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
+        gb_oam[i] = bytes[i];
+    }
+    gb_dma = page;
+    return 1;
+}
+
 static uint8_t write_high(uint8_t offset, uint8_t value)
 {
+    if (gb_timing_enabled && timed_register(offset)) {
+        gb_timing_write(offset, value);
+        return 1;
+    }
     switch (offset) {
     case 0x00:
         gb_joyp = value & 0x30;
@@ -251,6 +395,18 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
     case 0x45:
         gb_lyc = value;
         break;
+    case 0x46:
+        return transfer_oam(value);
+    case 0x47:
+    case 0x48:
+    case 0x49:
+    case 0x68:
+    case 0x69:
+    case 0x6a:
+    case 0x6b:
+    case 0x6c:
+        gb_video_write(offset, value);
+        break;
     case 0x4a:
         gb_wy = value;
         break;
@@ -267,6 +423,12 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
             gb_vbk = value & 1;
         }
         break;
+    case 0x51:
+    case 0x52:
+    case 0x53:
+    case 0x54:
+    case 0x55:
+        return gb_vram_dma_write(offset, value);
     case 0x56:
         if (gb_cgb) {
             gb_rp = value & 0xc1;
@@ -300,12 +462,18 @@ uint8_t gb_stop(void)
     if (!gb_cgb || !(gb_key1 & 1)) {
         return 0; /* Low-power STOP is outside the hardware model. */
     }
+    if (gb_timing_enabled) {
+        gb_timing_write(0x04, 0);
+    }
     gb_key1 = (gb_key1 ^ 0x80) & 0x80;
     return 1;
 }
 
 static uint8_t *work_or_high_ram_byte(uint24_t address)
 {
+    if (address >= 0xe000 && address < 0xfe00) {
+        address -= 0x2000;
+    }
     if (address >= GB_WRAM_BASE && address < GB_WRAM_BASE + 2 * GB_WRAM_SIZE) {
         unsigned offset = address - GB_WRAM_BASE;
         if (offset < GB_WRAM_SIZE) {
@@ -325,6 +493,9 @@ static uint8_t *ram_byte(uint24_t address)
     if (address >= GB_VRAM_BASE && address < GB_VRAM_BASE + GB_VRAM_SIZE) {
         return &gb_vram[gb_cgb ? gb_vbk : 0][address - GB_VRAM_BASE];
     }
+    if (address >= 0xfe00 && address < 0xfe00 + GB_OAM_SIZE) {
+        return &gb_oam[address - 0xfe00];
+    }
     return work_or_high_ram_byte(address);
 }
 
@@ -340,17 +511,87 @@ static uint16_t read_rom(uint16_t address)
     unsigned first = 0, last = gb_rom_data_count;
     while (first < last) {
         unsigned middle = first + (last - first) / 2;
-        const GbRomByte *entry = &gb_rom_data[middle];
-        if (entry->bank == bank && entry->address == address) {
-            return entry->value;
-        }
-        if (entry->bank < bank || (entry->bank == bank && entry->address < address)) {
+        const GbRomSpan *span = &gb_rom_data[middle];
+        if (span->bank < bank || (span->bank == bank && address >= span->address + span->length)) {
             first = middle + 1;
-        } else {
+        } else if (span->bank > bank || address < span->address) {
             last = middle;
+        } else {
+            return gb_rom_payload[span->offset + address - span->address];
         }
     }
     return GB_UNMAPPED_BYTE;
+}
+
+static uint24_t sram_offset(uint24_t address)
+{
+    return (((uint24_t)sram_bank << 13) | (address & 0x1fff)) & (gb_sram_size - 1);
+}
+
+static SramPage *find_sram_page(uint16_t number)
+{
+    for (unsigned i = 0; i < sram_page_count; ++i) {
+        if (sram_pages[i].number == number) {
+            return &sram_pages[i];
+        }
+    }
+    return 0;
+}
+
+static uint8_t read_sram(uint24_t address)
+{
+    if (!gb_ram_enabled || !gb_sram_size) {
+        return 0xff;
+    }
+    uint24_t offset = sram_offset(address);
+    uint16_t number = offset / SRAM_PAGE_SIZE;
+    SramPage *page = find_sram_page(number);
+    return page ? page->bytes[offset % SRAM_PAGE_SIZE] : sram_fill[number] ^ 0xff;
+}
+
+static uint8_t write_sram(uint24_t address, uint8_t value)
+{
+    if (!gb_ram_enabled || !gb_sram_size) {
+        return 1;
+    }
+    uint24_t offset = sram_offset(address);
+    uint16_t number = offset / SRAM_PAGE_SIZE;
+    SramPage *page = find_sram_page(number);
+    if (!page) {
+        uint8_t fill = sram_fill[number] ^ 0xff;
+        if (value == fill) {
+            return 1;
+        }
+        if (sram_page_count == SRAM_PAGE_LIMIT) {
+            return 0;
+        }
+        page = &sram_pages[sram_page_count++];
+        page->number = number;
+        page->matches = SRAM_PAGE_SIZE;
+        for (unsigned i = 0; i < SRAM_PAGE_SIZE; ++i) {
+            page->bytes[i] = fill;
+        }
+    }
+    unsigned index = offset % SRAM_PAGE_SIZE;
+    uint8_t previous = page->bytes[index];
+    if (previous == value) {
+        return 1;
+    }
+    page->bytes[index] = value;
+    if (index == 0) {
+        page->matches = 1;
+        for (unsigned i = 1; i < SRAM_PAGE_SIZE; ++i) {
+            page->matches += page->bytes[i] == value;
+        }
+    } else {
+        uint8_t first = page->bytes[0];
+        page->matches += (value == first) - (previous == first);
+    }
+    if (page->matches == SRAM_PAGE_SIZE) {
+        sram_fill[number] = value ^ 0xff;
+        *page = sram_pages[--sram_page_count];
+    }
+    return 1;
 }
 
 static uint16_t read_memory(uint24_t address)
@@ -361,6 +602,9 @@ static uint16_t read_memory(uint24_t address)
     }
     if (address < 0x8000) {
         return read_rom((uint16_t)address);
+    }
+    if (address >= 0xa000 && address < 0xc000) {
+        return read_sram(address);
     }
     if (address >= 0xff00 && address <= 0xffff) {
         return read_high((uint8_t)address);
@@ -373,6 +617,8 @@ static uint8_t write_memory(uint24_t address, uint8_t value)
     uint8_t *byte = ram_byte(address);
     if (byte) {
         *byte = value;
+    } else if (address >= 0xa000 && address < 0xc000) {
+        return write_sram(address, value);
     } else if (address >= 0xff00 && address <= 0xffff) {
         return write_high((uint8_t)address, value);
     } else if (gb_mbc5 && address < 0x2000) {
@@ -385,6 +631,8 @@ static uint8_t write_memory(uint24_t address, uint8_t value)
             bank = (bank & 0xff) | ((uint16_t)(value & 1) << 8);
         }
         gb_rom_bank = bank & gb_rom_bank_mask;
+    } else if (gb_mbc5 && address < 0x6000) {
+        sram_bank = value & 0x0f;
     } else {
         return 0;
     }
@@ -401,6 +649,32 @@ uint8_t gb_load_a(uint24_t address)
     return 1;
 }
 
+uint24_t gb_read_byte(uint24_t address)
+{
+    return read_memory(address);
+}
+
+uint8_t gb_write_byte(uint24_t address, uint8_t value)
+{
+    return write_memory(address, value);
+}
+
+uint8_t gb_step_hl(uint8_t decrement)
+{
+    uint16_t address = gb_hl;
+    uint16_t value = read_memory(address);
+    if (value == GB_UNMAPPED_BYTE) {
+        return 0;
+    }
+    uint8_t previous_flags = gb_f;
+    uint8_t result = gb_step_byte((uint8_t)value, decrement);
+    if (!write_memory(address, result)) {
+        gb_f = previous_flags;
+        return 0;
+    }
+    return 1;
+}
+
 uint8_t gb_load_hli(void)
 {
     uint16_t address = (uint16_t)gb_hl;
@@ -408,6 +682,16 @@ uint8_t gb_load_hli(void)
         return 0;
     }
     gb_hl = (uint16_t)(address + 1);
+    return 1;
+}
+
+uint8_t gb_load_hld(void)
+{
+    uint16_t address = (uint16_t)gb_hl;
+    if (!gb_load_a(address)) {
+        return 0;
+    }
+    gb_hl = (uint16_t)(address - 1);
     return 1;
 }
 

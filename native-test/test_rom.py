@@ -103,6 +103,43 @@ def color_rom():
     return data
 
 
+def frame_rom():
+    data = cartridge_image()
+    data[0x100:0x103] = bytes.fromhex("c3 50 01")
+    data[0x40:0x46] = bytes.fromhex("3e a5 ea 23 c1 d9")  # VBlank handler.
+    data[0x300:0x310] = bytes.fromhex("f0 00") * 8  # Each tile row is half red.
+    code = bytearray.fromhex(
+        "31 00 d0 f3 af e0 40 e0 0f"  # Disable LCD and clear pending interrupts.
+        " 3e 01 e0 ff"  # Enable VBlank IRQ.
+        " 3e 82 e0 68 3e 1f e0 69 af e0 69"  # BG palette 0, color 1 = red.
+        " 3e 03 e0 51 af e0 52 e0 53 e0 54 e0 55"  # Copy one tile into VRAM with GDMA.
+    )
+    code.extend(bytes.fromhex("3e 22 ea 00 c0 3e c0 e0 46"))  # Copy a WRAM page into OAM.
+    code.extend(bytes.fromhex("3e 91 e0 40 fb 00 76"))  # Turn on LCD, EI, NOP, HALT.
+    data[0x150:0x150 + len(code)] = code
+    return data, (0, 0x150 + len(code))
+
+
+def restart_rom():
+    data = cartridge_image()
+    data[0x147:0x14a] = bytes.fromhex("1b 01 03")
+    data[0x14d] = (-sum(data[0x134:0x14d]) - 0x19) & 0xff
+    data[0x100:0x103] = bytes.fromhex("c3 50 01")
+    code = bytes.fromhex("31 00 d0 3e 01 ea 00 20 df d3 ea 23 c1 76")
+    data[0x150:0x150 + len(code)] = code
+    vector = bytes.fromhex("e1 23 e5 3e 02 ea 00 20 c3 00 40")
+    data[0x18:0x18 + len(vector)] = vector  # Skip the inline byte and change ROM banks.
+    banked = bytes.fromhex(
+        "3e 0a ea 00 00"  # Enable external RAM.
+        " 21 00 a0 01 00 20 af 22 0b 78 b1 20 f9"  # Clear one SRAM bank.
+        " 3e 01 ea 00 40 3e a5 ea 00 a1"  # Write bank 1.
+        " 3e 02 ea 00 40 3e 5a ea 00 a1"  # Write bank 2.
+        " 3e 01 ea 00 40 fa 00 a1 c9"  # Return the byte from bank 1.
+    )
+    data[2 * BANK_SIZE:2 * BANK_SIZE + len(banked)] = banked
+    return data
+
+
 class RomTest(unittest.TestCase):
     def test_reachable_code_and_banks(self):
         data = synthetic_rom()
@@ -145,9 +182,9 @@ class RomTest(unittest.TestCase):
 
     def test_color_fixture_includes_data_from_each_cartridge_bank(self):
         assembly, targets = compile_rom(color_rom(), watch_address=0xc123)
-        self.assertIn("{0x001, 0x4567, 0x3c}", targets)
-        self.assertIn("{0x001, 0x4568, 0x76}", targets)
-        self.assertIn("{0x002, 0x4567, 0xa5}", targets)
+        self.assertIn("{0x001, 0x4567, 0x0002, 0x000000}", targets)
+        self.assertIn("{0x002, 0x4567, 0x0001, 0x000002}", targets)
+        self.assertIn("0x3c, 0x76, 0xa5,", targets)
         self.assertIn("call _gb_load_hli", assembly)
         self.assertIn("call _gb_stop", assembly)
 
@@ -185,8 +222,12 @@ class RomTest(unittest.TestCase):
         self.assertIn((2, 0x4003), instructions)
         self.assertNotIn((1, 0x4003), instructions)
 
-    def test_runtime_target_can_be_seeded(self):
+    def test_runtime_target_is_discovered_from_known_stack_bytes(self):
+        self.assertIn((2, 0x4321), Cartridge(indirect_rom()).discover())
+
+    def test_unknown_runtime_target_can_be_seeded(self):
         data = indirect_rom()
+        data[0x108:0x10a] = bytes.fromhex("f0 80")
         self.assertNotIn((2, 0x4321), Cartridge(data).discover())
         self.assertIn((2, 0x4321), Cartridge(data).discover([(2, 0x4321)]))
 
@@ -205,9 +246,32 @@ class RomTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"\$002:\$4000: unsupported opcode \$D3"):
             compile_rom(data)
 
+    def test_timed_halt_keeps_resume_and_interrupt_targets(self):
+        data, checkpoint = frame_rom()
+        assembly, targets = compile_rom(data, [(0, 0x40)], stop_at=checkpoint, timing=True)
+        self.assertIn("call _gb_boundary", assembly)
+        self.assertIn("jp _gb_reti", assembly)
+        self.assertIn("gb_000_0040", targets)
+        self.assertIn(f"gb_000_{checkpoint[1]:04x}", targets)
+        self.assertIn("gb_rom_span_count = 1", targets)
+        self.assertIn("{0x000, 0x0300, 0x0010, 0x000000}", targets)
+
+    def test_unsupported_opcodes_can_be_deferred_to_a_runtime_fault(self):
+        data = cartridge_image()
+        assembly, targets = compile_rom(data, trap_unsupported=True)
+        self.assertIn("jp _gb_unmapped", assembly)
+        self.assertIn("gb_000_0100", targets)
+
+    def test_restart_through_banked_target_skips_inline_byte(self):
+        instructions = Cartridge(restart_rom()).discover()
+        self.assertIn((2, 0x4000), instructions)
+        self.assertIn((0, 0x15a), instructions)
+        self.assertNotIn((0, 0x159), instructions)
+
 
 if __name__ == "__main__":
-    fixtures = {"--write": synthetic_rom, "--write-color": color_rom}
+    fixtures = {"--write": synthetic_rom, "--write-color": color_rom,
+                "--write-frame": lambda: frame_rom()[0], "--write-rst": restart_rom}
     if len(sys.argv) == 3 and sys.argv[1] in fixtures:
         output = Path(sys.argv[2])
         output.parent.mkdir(parents=True, exist_ok=True)

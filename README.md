@@ -12,11 +12,13 @@ python native-test/recompile.py input.gbc output.8xp
 
 Outside a toolchain shell, pass `--cedev` with the installed CEdev directory. Send the resulting file to RAM and run `GBCRUN` on an OS setup that supports native programs.
 
-The prototype supports a subset of Game Boy instructions, ROM-only and MBC5 cartridges, and Color-mode video RAM and work RAM banking. The hardware model tracks startup register writes and speed selection. Rendering, hardware timing, and interrupt delivery are still pending.
+The prototype supports a subset of Game Boy instructions, ROM-only and MBC5 cartridges, and Color-mode video RAM and work RAM banking. MBC5 save RAM starts erased on each run and uses a bounded in-memory store.
 
-Unsupported instructions are reported with their bank and address. Use `--entry BANK:ADDRESS` in hex to include a dynamic destination the compiler cannot discover.
+Unsupported instructions are reported with their bank and address. Use `--entry BANK:ADDRESS` in hex to include a dynamic destination the compiler cannot discover. Use `--trap-unsupported` to defer unsupported-opcode errors to runtime and see which one the program actually reaches.
 
 Use `--stop-at BANK:ADDRESS` to stop before executing a reachable instruction. Use `--watch ADDRESS` to show a byte of video RAM, work RAM, or high RAM when the program stops. The watch uses the bank selected at that point.
+
+`--timing` enables instruction-boundary LCD and timer timing and interrupt delivery. Include interrupt vectors with `--entry`, optionally supplying the stack pointer as `BANK:ADDRESS:SP`. `--frame` displays a snapshot of the guest's background, window, and sprites on a normal stop.
 
 ## Regression test
 
