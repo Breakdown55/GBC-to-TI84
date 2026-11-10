@@ -132,15 +132,18 @@ def build(ce, work, name, show_frame=False, input_after=None):
     convert_args = ("-u", "-n", name, "-j", "elf", "-i", "program.obj", "-o", "program.8xp")
     run("bin/convbin", "-k", "8xp", *convert_args)
     parts = list(work.glob("program.8xp.*.8xv"))
-    if parts:
-        # The split launcher depends on companion AppVars. Try a single compressed program.
+    if not parts:
+        return False
+    # The split launcher depends on companion AppVars. Try a single compressed program.
+    for compression in ("zx7", "zx0"):
         for part in parts:
             part.unlink()
-        run("bin/convbin", "-k", "8xp-compressed", "-e", "zx7", "-r", *convert_args)
-        if any(work.glob("program.8xp.*.8xv")):
-            raise ValueError("generated program exceeds the single-file TI program limit")
-        guard_compressed_program(run, work)
-    return bool(parts)
+        run("bin/convbin", "-k", "8xp-compressed", "-e", compression, "-r", *convert_args)
+        parts = list(work.glob("program.8xp.*.8xv"))
+        if not parts:
+            guard_compressed_program(run, work)
+            return True
+    raise ValueError("generated program exceeds the single-file TI program limit")
 
 
 def parse_entry(text):

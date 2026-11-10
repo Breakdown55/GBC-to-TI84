@@ -11,13 +11,19 @@ enum {
 
 extern uint8_t gb_oam[GB_OAM_SIZE];
 extern uint8_t gb_video_dirty;
+extern uint8_t gb_oam_dirty;
 
-static inline void gb_video_store(uint8_t *byte, uint8_t value)
+static inline void gb_video_store_dirty(uint8_t *byte, uint8_t value, uint8_t *dirty)
 {
     if (*byte != value) {
         *byte = value;
-        gb_video_dirty = 1;
+        *dirty = 1;
     }
+}
+
+static inline void gb_video_store(uint8_t *byte, uint8_t value)
+{
+    gb_video_store_dirty(byte, value, &gb_video_dirty);
 }
 
 void gb_video_init(void);
