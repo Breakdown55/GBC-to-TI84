@@ -23,8 +23,80 @@ BYTE_REGISTERS = {
     "d": "_gb_de+1", "e": "_gb_de",
 }
 FAULT_IF_ZERO = ["or a, a", "jp z, _gb_unmapped"]
-ALU_OPERATIONS = ("add", "adc", "sub", "sbc", "and", "xor", "or", "cp")
 ROTATES = {"rlca": "rlca", "rrca": "rrca", "rla": "rla", "rra": "rra"}
+
+GUEST_LABEL = re.compile(r"_gb_[0-9a-f]{3}_[0-9a-f]{4}")
+RESIDENT_LOADS = {"ld a, (_gb_a)": "a", "ld hl, (_gb_hl)": "hl"}
+RESIDENT_STORES = {"ld (_gb_a), a": "a", "ld (_gb_hl), hl": "hl"}
+STATE_MOVE = re.compile(
+    r"ld (a|hl|[bcdehl]|\(_gb_[a-z_]+(?:\+\d+)?\)), "
+    r"(0x[0-9a-f]+|a|hl|[bcdehl]|\(_gb_[a-z_]+(?:\+\d+)?\))"
+)
+A_ARITHMETIC = re.compile(r"(?:add|adc|sub|sbc|and|xor|or) a, (?:[abcdehl]|0x[0-9a-f]+)")
+A_COMPARE = re.compile(r"cp a, (?:[abcdehl]|0x[0-9a-f]+)")
+
+
+def reuse_native_registers(assembly, dispatch_entries):
+    """Forward guest A and HL inside straight-line native code.
+
+    Retain the last write to each guest slot at every possible entry, exit,
+    or unknown helper call. A write may be removed only when a later write
+    supersedes it without an intervening read from the slot.
+    """
+    entries = set(dispatch_entries)
+    for line in assembly:
+        if line.startswith(("    jp ", "    jr ", "    call ")):
+            entries.update(GUEST_LABEL.findall(line))
+
+    resident = set()
+    stores = {}
+    for index, line in enumerate(assembly):
+        operation = line.strip()
+        if not operation or operation.startswith((".assume ", ".section ", ".global ")):
+            continue
+        if operation.endswith(":") and GUEST_LABEL.fullmatch(operation[:-1]) and operation[:-1] not in entries:
+            continue
+        if operation in RESIDENT_LOADS:
+            register = RESIDENT_LOADS[operation]
+            if register in resident:
+                assembly[index] = ""
+            else:
+                stores.pop(register, None)
+                resident.add(register)
+            continue
+        if operation in RESIDENT_STORES:
+            register = RESIDENT_STORES[operation]
+            if register in stores:
+                assembly[stores[register]] = ""
+            stores[register] = index
+            resident.add(register)
+            continue
+        move = STATE_MOVE.fullmatch(operation)
+        if move:
+            destination, source = move.groups()
+            # Byte reads/writes can alias the three-byte backing slot for HL.
+            if source in ("(_gb_hl)", "(_gb_hl+1)", "(_gb_hl+2)"):
+                stores.pop("hl", None)
+            if destination in ("(_gb_hl)", "(_gb_hl+1)", "(_gb_hl+2)"):
+                stores.pop("hl", None)
+                resident.discard("hl")
+            if destination in ("h", "l", "hl"):
+                resident.discard("hl")
+            if destination == "a":
+                resident.discard("a")
+            continue
+        if A_COMPARE.fullmatch(operation) or operation in ("or a, a", "and a, a"):
+            continue
+        if A_ARITHMETIC.fullmatch(operation) or operation in ("inc a", "dec a", "cpl", *ROTATES):
+            resident.discard("a")
+            continue
+        if operation in ("inc hl", "dec hl", "call _gb_native_flags", "call _gb_native_step_flags"):
+            resident.discard("hl")
+            continue
+        # Branches, fault paths, arbitrary memory operations and other helpers
+        # may read or replace any canonical guest state.
+        resident.clear()
+        stores.clear()
 
 
 def operand_address(operand):
@@ -80,24 +152,6 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
     # A byte count advances the Game Boy PC. None ends the native block.
     if parts == ["nop"]:
         return [], 1
-    logical = re.fullmatch(r"(or|and|xor)\s+(a|c|\$[0-9a-f]{1,2})", normalized)
-    if logical:
-        operation, operand = logical.groups()
-        immediate = operand.startswith("$")
-        setup = ["ld a, (_gb_bc)", "ld c, a"] if operand == "c" else []
-        operand = f"0x{operand[1:]}" if immediate else operand
-        flags = 0x20 if operation == "and" else 0
-        return [
-            *setup,
-            "ld a, (_gb_a)",
-            f"{operation} a, {operand}",
-            "ld (_gb_a), a",
-            f"ld a, 0x{flags:02x}",
-            "jr nz, 1f",
-            f"ld a, 0x{flags | 0x80:02x}",
-            "1:",
-            "ld (_gb_f), a",
-        ], 2 if immediate else 1
     if parts == ["di"]:
         if timing:
             return ["call _gb_di"], 1
@@ -192,16 +246,19 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         ], 2
     alu = re.fullmatch(r"(add|adc|sub|sbc|and|xor|or|cp)\s+(?:a\s*,\s*)?([abcdehl]|\[hl\]|\$[0-9a-f]{1,2})", normalized)
     if alu:
-        operation = ALU_OPERATIONS.index(alu[1])
-        operand = alu[2]
-        if operand == "[hl]":
-            return [*call_with_arg("gb_alu_hl", operation), *FAULT_IF_ZERO], 1
+        operation, operand = alu.groups()
         immediate = operand.startswith("$")
-        setup = [] if immediate else [f"ld a, ({BYTE_REGISTERS[operand]})", "ld c, a"]
-        carry = ["ld a, (_gb_f)", "and a, 0x10", "add a, 0xf0"] if alu[1] in ("adc", "sbc") else []
-        argument = f"0x{int(operand[1:], 16):02x}" if immediate else "c"
-        store = [] if alu[1] == "cp" else ["ld (_gb_a), a"]
-        return [*setup, *carry, "ld a, (_gb_a)", f"{alu[1]} a, {argument}",
+        if operand == "[hl]":
+            setup = [*read_indirect_byte(), "ld c, a"]
+        elif immediate or operand == "a":
+            setup = []
+        else:
+            setup = [f"ld a, ({BYTE_REGISTERS[operand]})", "ld c, a"]
+        carry = ["ld a, (_gb_f)", "and a, 0x10", "add a, 0xf0"] if operation in ("adc", "sbc") else []
+        argument = f"0x{int(operand[1:], 16):02x}" if immediate else "a" if operand == "a" else "c"
+        store = [] if operation == "cp" or (operand == "a" and operation in ("and", "or")) else ["ld (_gb_a), a"]
+        load = [] if operation == "xor" and operand == "a" else ["ld a, (_gb_a)"]
+        return [*setup, *carry, *load, f"{operation} a, {argument}",
                 *store, "call _gb_native_flags"], 2 if immediate else 1
     register_load = re.fullmatch(r"ld\s+([abcdehl])\s*,\s*([abcdehl])", normalized)
     if register_load:

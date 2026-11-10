@@ -4,6 +4,7 @@
 #include "timing.h"
 #include "vram_dma.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 
 enum {
@@ -207,16 +208,6 @@ void gb_alu(uint8_t operation, uint8_t operand)
         gb_a = result;
     }
     gb_f = flags | (result == 0 ? GB_FLAG_Z : 0);
-}
-
-uint8_t gb_alu_hl(uint8_t operation)
-{
-    uint16_t value = read_memory((uint16_t)gb_hl);
-    if (value == GB_UNMAPPED_BYTE) {
-        return 0;
-    }
-    gb_alu(operation, (uint8_t)value);
-    return 1;
 }
 
 static bool timed_register(uint8_t offset)
@@ -897,31 +888,34 @@ static GbNativeBlock lookup_address(const GbTargetBank *bank, uint16_t address)
     return 0;
 }
 
+enum { LOOKUP_CACHE_SIZE = 32 };
+typedef struct {
+    uint16_t address, bank;
+    GbNativeBlock entry;
+    uint8_t padding;
+} LookupCacheEntry;
+
+/* dispatch.S probes these records directly before taking the C lookup path. */
+#ifdef __TICE__
+_Static_assert(sizeof(LookupCacheEntry) == 8 && offsetof(LookupCacheEntry, entry) == 4,
+               "dispatch cache layout must match the assembly");
+#endif
+LookupCacheEntry gb_lookup_cache[LOOKUP_CACHE_SIZE] __attribute__((aligned(256)));
+
 GbNativeBlock gb_lookup(uint24_t address)
 {
     if (address >= 0x8000 && (address < GB_HRAM_BASE || address >= 0xffff)) {
         return 0;
     }
     uint16_t bank = address >= 0x4000 && address < 0x8000 ? gb_rom_bank : 0;
-    enum { CACHE_SIZE = 32 };
-    static struct {
-        GbNativeBlock entry;
-        uint16_t address, bank;
-        uint8_t padding;
-    } cache[CACHE_SIZE];
-    unsigned slot = (address ^ (address >> 5) ^ bank) & (CACHE_SIZE - 1);
-    if (cache[slot].entry && cache[slot].bank == bank && cache[slot].address == address) {
-        return cache[slot].entry;
-    }
+    unsigned slot = (address ^ (address >> 8) ^ bank) & (LOOKUP_CACHE_SIZE - 1);
     unsigned first = 0, last = gb_target_bank_count;
     while (first < last) {
         unsigned middle = first + (last - first) / 2;
         const GbTargetBank *group = &gb_target_banks[middle];
         if (group->bank == bank) {
             GbNativeBlock entry = lookup_address(group, (uint16_t)address);
-            cache[slot].address = address;
-            cache[slot].bank = bank;
-            cache[slot].entry = entry;
+            gb_lookup_cache[slot] = (LookupCacheEntry){(uint16_t)address, bank, entry, 0};
             return entry;
         }
         if (group->bank < bank) {

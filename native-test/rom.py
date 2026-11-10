@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from itertools import groupby
 from typing import Optional
 
-from translate import dispatch, lower_instruction
+from translate import dispatch, lower_instruction, reuse_native_registers
 
 
 BANK_SIZE = 0x4000
@@ -1236,6 +1236,10 @@ def outline_repeated(assembly, repeated):
     replacements = {}
     needs_fault_exit = False
     for body, offsets in repeated.items():
+        offsets = [offset for offset in offsets
+                   if all(assembly[offset + i] == f"    {line}" for i, line in enumerate(body))]
+        if not offsets:
+            continue
         # Absolute guest-state loads/stores and ADL calls take at least four bytes.
         minimum = sum(4 if "_gb_" in line or line.startswith("call ") else 1
                       for line in body if not line.endswith(":"))
@@ -1404,9 +1408,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 fallback_addresses.add(next_pc)
                 assembly.extend(f"    {line}" for line in dispatch(next_pc))
     assembly.extend(checked_helper_stubs(helpers))
-    if repeated:
-        assembly = outline_repeated(assembly, repeated)
     entries = []
+    entry_labels = []
     target_banks = []
     for (bank, pc), instruction in ordered:
         if (dispatch_targets is not None and None not in dispatch_targets
@@ -1416,7 +1419,12 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         if not target_banks or target_banks[-1][0] != bank:
             target_banks.append([bank, len(entries), 0])
         target_banks[-1][2] += 1
+        entry_labels.append(f"_{symbol(bank, pc)}")
         entries.append(f"    {{0x{pc:04x}, {symbol(bank, pc)}}},")
+    if vblank_preview and not timing:
+        reuse_native_registers(assembly, entry_labels)
+    if repeated:
+        assembly = outline_repeated(assembly, repeated)
     spans = []
     payload = bytearray()
     for bank, address in sorted(rom_bytes):

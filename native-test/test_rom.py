@@ -404,10 +404,26 @@ class RomTest(unittest.TestCase):
 
     def test_preview_shares_repeated_native_bodies(self):
         data = cartridge_image()
-        data[0x100:0x106] = bytes.fromhex("06 05 78 78 78 76")
+        data[0x100:0x106] = bytes.fromhex("06 05 48 48 48 76")
         assembly, _ = compile_rom(data, stop_at=(0, 0x105), vblank_preview=1)
         self.assertEqual(assembly.count("call .Lshared_"), 3)
-        self.assertIn("ld a, (_gb_bc+1)\n    ld (_gb_a), a\n    ret", assembly)
+        self.assertIn("ld a, (_gb_bc+1)\n    ld (_gb_bc), a\n    ret", assembly)
+
+    def test_register_reuse_preserves_entries_and_spills_for_helpers(self):
+        from translate import reuse_native_registers
+        assembly = [
+            "    ld a, 0x2a", "    ld (_gb_a), a",
+            "_gb_000_0102:", "    ld a, (_gb_a)", "    inc a",
+            "    ld (_gb_a), a", "    call _gb_native_step_flags",
+            "    ld a, (_gb_a)", "    ld (_gb_bc), a",
+            "    call _gb_store_hl", "_gb_000_0106:", "    ld a, (_gb_a)",
+        ]
+        reuse_native_registers(assembly, {"_gb_000_0106"})
+        self.assertEqual(assembly[1], "")
+        self.assertEqual(assembly[3], "")
+        self.assertEqual(assembly[7], "")
+        self.assertEqual(assembly[5], "    ld (_gb_a), a")
+        self.assertEqual(assembly[11], "    ld a, (_gb_a)")
 
     def test_preview_shared_fault_discards_the_native_return_address(self):
         data = cartridge_image()

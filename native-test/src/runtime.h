@@ -90,7 +90,6 @@ void gb_add_sp(uint8_t offset);
 uint8_t gb_step_byte(uint8_t value, uint8_t decrement);
 uint8_t gb_step_hl(uint8_t decrement);
 void gb_alu(uint8_t operation, uint8_t operand);
-uint8_t gb_alu_hl(uint8_t operation);
 uint8_t gb_read_high(uint8_t offset);
 uint8_t gb_write_high(uint8_t offset);
 void gb_set_buttons(uint8_t buttons);

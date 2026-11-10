@@ -138,18 +138,19 @@ _gb_write_indirect:
     .global _gb_native_step_flags
 _gb_native_flags:
     push af
-    pop hl
-    ld a, l
+    pop de
+    ld a, e
     ld hl, .Lflag_map
     ld l, a
     ld a, (hl)
     ld (_gb_f), a
+    ld a, d
     ret
 
 _gb_native_step_flags:
     push af
-    pop hl
-    ld a, l
+    pop de
+    ld a, e
     ld hl, .Lflag_map
     ld l, a
     ld a, (hl)
@@ -159,6 +160,7 @@ _gb_native_step_flags:
     and a, 0x10
     or a, c
     ld (_gb_f), a
+    ld a, d
     ret
 
     .section .rodata.gb_native_flags
@@ -206,6 +208,48 @@ _gb_ret:
 
 _gb_dispatch:
     ld (_gb_pc), hl
+    ld d, h
+    ld e, l
+    ld bc, 0
+    ld a, h
+    and a, 0xc0
+    cp a, 0x40
+    jr nz, .Lcache_bank_ready
+    ld bc, (_gb_rom_bank)
+.Lcache_bank_ready:
+    ld a, e
+    xor a, d
+    xor a, c
+    and a, 31
+    add a, a
+    add a, a
+    add a, a
+    ld hl, _gb_lookup_cache
+    ld l, a
+    ld a, (hl)
+    cp a, e
+    jr nz, .Llookup_miss
+    inc hl
+    ld a, (hl)
+    cp a, d
+    jr nz, .Llookup_miss
+    inc hl
+    ld a, (hl)
+    cp a, c
+    jr nz, .Llookup_miss
+    inc hl
+    ld a, (hl)
+    cp a, b
+    jr nz, .Llookup_miss
+    inc hl
+    ld hl, (hl)
+    ld de, 0
+    or a, a
+    sbc hl, de
+    jr z, .Llookup_miss
+    jp (hl)
+.Llookup_miss:
+    ld hl, (_gb_pc)
     push hl
     call _gb_lookup
     pop bc
