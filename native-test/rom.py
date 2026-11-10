@@ -1559,17 +1559,20 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     assembly.extend(checked_helper_stubs(helpers))
     entries = []
     entry_labels = []
-    target_banks = []
+    target_pages = []
     for (bank, pc), instruction in ordered:
         if (dispatch_targets is not None and None not in dispatch_targets
                 and (bank, pc) not in dispatch_targets and pc not in fallback_addresses
                 and (bank, pc) != (0, ENTRY) and instruction.opcode != CHECKPOINT):
             continue
-        if not target_banks or target_banks[-1][0] != bank:
-            target_banks.append([bank, len(entries), 0])
-        target_banks[-1][2] += 1
+        page = (bank << 8) | (pc >> 8)
+        if not target_pages or target_pages[-1][0] != page:
+            if len(entries) > 0xffff:
+                raise ValueError("native target table exceeds the calculator address index")
+            target_pages.append([page, len(entries), 0])
+        target_pages[-1][2] += 1
         entry_labels.append(f"_{symbol(bank, pc)}")
-        entries.append(f"    {{0x{pc:04x}, {symbol(bank, pc)}}},")
+        entries.append(f"    {{0x{pc & 255:02x}, {symbol(bank, pc)}}},")
     if vblank_preview and not timing:
         external_entries = predicted_entries.union(entry_labels)
         forward_native_flags(assembly, native_entries(assembly, external_entries))
@@ -1601,10 +1604,10 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     ]
     targets.extend([
         "", "const GbTarget gb_targets[] = {", *entries, "};",
-        "const GbTargetBank gb_target_banks[] = {",
-        *(f"    {{0x{bank:03x}, {first}, {count}}}," for bank, first, count in target_banks),
+        "const GbTargetPage gb_target_pages[] = {",
+        *(f"    {{0x{page:05x}, {first}, {count - 1}}}," for page, first, count in target_pages),
         "};",
-        f"const unsigned gb_target_bank_count = {len(target_banks)};",
+        f"const unsigned gb_target_page_count = {len(target_pages)};",
         f"const uint16_t rom_bank_mask = {cartridge.bank_mask};",
         f"const uint16_t rom_watch_address = 0x{watch_address:04x};",
         f"const uint8_t rom_mbc5 = {int(cartridge.mbc5)};",

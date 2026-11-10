@@ -184,6 +184,14 @@ def tilemap_rom():
 
 
 class RomTest(unittest.TestCase):
+    def test_target_page_can_index_all_256_low_bytes(self):
+        data = cartridge_image()
+        data[0x100:0x103] = bytes.fromhex("c3 00 02")
+        data[0x200:0x300] = bytes(255) + b"\x76"
+        _, targets = compile_rom(data)
+        self.assertIn("{0x00002, 1, 255}", targets)
+        self.assertIn("{0xff, gb_000_02ff}", targets)
+
     def test_offloading_keeps_explicit_rom_data_and_native_code(self):
         data = cartridge_image()
         data[0x100:0x107] = bytes.fromhex("fa 00 41 fa 10 41 76")
@@ -310,7 +318,8 @@ class RomTest(unittest.TestCase):
         self.assertNotIn((0, 0x104), instructions)  # Cartridge header.
         assembly, targets = compile_rom(data, watch_address=0xc123)
         self.assertIn("jp _gb_call", assembly)
-        self.assertIn("{0x4000, gb_002_4000}", targets)
+        self.assertIn("{0x00, gb_002_4000}", targets)
+        self.assertIn("{0x00240,", targets)
         self.assertIn("rom_watch_address = 0xc123", targets)
 
     def test_unknown_zero_flag_keeps_both_branches(self):

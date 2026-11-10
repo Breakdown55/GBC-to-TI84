@@ -56,28 +56,32 @@ static void stop_after_fixture_call(void)
 }
 
 const GbTarget gb_targets[] = {
-    {0x0321, bank_0_0321},
-    {0x0803, bank_0_0803},
-    {0x0903, branch_fallthrough},
-    {0x0910, branch_taken},
-    {0x100a, stop_after_fixture_call},
-    {0x1100, gb_000_1100},
-    {0x1108, gb_000_1108},
-    {0x110e, gb_000_110e},
-    {0x1120, gb_000_1120},
-    {0x1123, gb_000_1123},
-    {0x1140, gb_000_1140},
-    {0x1146, gb_000_1146},
-    {0x114a, gb_000_114a},
-    {0x4800, bank_3_4800},
-    {0x4800, bank_4_4800},
+    {0x21, bank_0_0321},
+    {0x03, bank_0_0803},
+    {0x03, branch_fallthrough},
+    {0x10, branch_taken},
+    {0x0a, stop_after_fixture_call},
+    {0x00, gb_000_1100},
+    {0x08, gb_000_1108},
+    {0x0e, gb_000_110e},
+    {0x20, gb_000_1120},
+    {0x23, gb_000_1123},
+    {0x40, gb_000_1140},
+    {0x46, gb_000_1146},
+    {0x4a, gb_000_114a},
+    {0x00, bank_3_4800},
+    {0x00, bank_4_4800},
 };
-const GbTargetBank gb_target_banks[] = {
-    {0, 0, 13},
-    {3, 13, 1},
-    {4, 14, 1},
+const GbTargetPage gb_target_pages[] = {
+    {0x0003, 0, 0},
+    {0x0008, 1, 0},
+    {0x0009, 2, 1},
+    {0x0010, 4, 0},
+    {0x0011, 5, 7},
+    {0x0348, 13, 0},
+    {0x0448, 14, 0},
 };
-const unsigned gb_target_bank_count = sizeof(gb_target_banks) / sizeof(gb_target_banks[0]);
+const unsigned gb_target_page_count = sizeof(gb_target_pages) / sizeof(gb_target_pages[0]);
 
 void gb_unmapped(void)
 {

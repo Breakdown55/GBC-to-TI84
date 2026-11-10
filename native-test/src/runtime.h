@@ -13,15 +13,15 @@ enum {
 typedef void (*GbNativeBlock)(void);
 
 typedef struct __attribute__((packed)) {
-    uint16_t address;
+    uint8_t low;
     GbNativeBlock entry;
 } GbTarget;
 
-typedef struct {
-    uint16_t bank;
-    unsigned first;
-    unsigned count;
-} GbTargetBank;
+typedef struct __attribute__((packed)) {
+    uint24_t key;
+    uint16_t first;
+    uint8_t count_minus_one; /* A full page has 256 targets. */
+} GbTargetPage;
 
 typedef struct __attribute__((packed)) {
     uint16_t bank;
@@ -30,9 +30,9 @@ typedef struct __attribute__((packed)) {
     uint24_t offset;
 } GbRomSpan;
 
-extern const GbTarget gb_targets[]; /* Sorted by guest address within each bank. */
-extern const GbTargetBank gb_target_banks[];
-extern const unsigned gb_target_bank_count;
+extern const GbTarget gb_targets[]; /* Sorted by low byte within each guest page. */
+extern const GbTargetPage gb_target_pages[]; /* Sorted by bank and high byte. */
+extern const unsigned gb_target_page_count;
 extern const GbRomSpan *gb_rom_data;
 extern const uint8_t *gb_rom_payload;
 extern unsigned gb_rom_data_count;

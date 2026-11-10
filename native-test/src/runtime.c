@@ -944,16 +944,16 @@ uint8_t gb_set_hl_bit(uint8_t bit)
     return write_memory(address, (uint8_t)(value | (1U << bit)));
 }
 
-static GbNativeBlock lookup_address(const GbTargetBank *bank, uint16_t address)
+static GbNativeBlock lookup_address(const GbTargetPage *page, uint8_t low)
 {
-    unsigned first = bank->first, last = first + bank->count;
+    unsigned first = page->first, last = first + page->count_minus_one + 1;
     while (first < last) {
         unsigned middle = first + (last - first) / 2;
         const GbTarget *target = &gb_targets[middle];
-        if (target->address == address) {
+        if (target->low == low) {
             return target->entry;
         }
-        if (target->address < address) {
+        if (target->low < low) {
             first = middle + 1;
         } else {
             last = middle;
@@ -983,23 +983,19 @@ GbNativeBlock gb_lookup(uint24_t address)
     }
     uint16_t bank = address >= 0x4000 && address < 0x8000 ? gb_rom_bank : 0;
     unsigned slot = (address ^ (address >> 8) ^ bank) & (LOOKUP_CACHE_SIZE - 1);
-    if (!gb_target_bank_count) return 0;
-    static const GbTargetBank *last_switch_group;
-    const GbTargetBank *group = gb_target_banks;
-    if (group->bank != bank) {
-        group = last_switch_group;
-        if (!group || group->bank != bank) {
-            unsigned first = 1, last = gb_target_bank_count;
-            while (first < last) {
-                unsigned middle = first + (last - first) / 2;
-                if (gb_target_banks[middle].bank < bank) first = middle + 1;
-                else last = middle;
-            }
-            if (first == gb_target_bank_count || gb_target_banks[first].bank != bank) return 0;
-            last_switch_group = group = &gb_target_banks[first];
+    uint24_t key = ((uint24_t)bank << 8) | (address >> 8);
+    static const GbTargetPage *page;
+    if (!page || page->key != key) {
+        unsigned first = 0, last = gb_target_page_count;
+        while (first < last) {
+            unsigned middle = first + (last - first) / 2;
+            if (gb_target_pages[middle].key < key) first = middle + 1;
+            else last = middle;
         }
+        if (first == gb_target_page_count || gb_target_pages[first].key != key) return 0;
+        page = &gb_target_pages[first];
     }
-    GbNativeBlock entry = lookup_address(group, (uint16_t)address);
+    GbNativeBlock entry = lookup_address(page, (uint8_t)address);
     gb_lookup_cache[slot] = (LookupCacheEntry){(uint16_t)address, bank, entry, 0};
     return entry;
 }

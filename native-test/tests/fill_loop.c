@@ -6,8 +6,8 @@
 uint8_t gb_timing_enabled;
 uint8_t gb_oam[GB_OAM_SIZE], gb_oam_dirty, gb_video_dirty;
 const GbTarget gb_targets[] = {{0, 0}};
-const GbTargetBank gb_target_banks[] = {{0, 0, 0}};
-const unsigned gb_target_bank_count = 0;
+const GbTargetPage gb_target_pages[] = {{0, 0, 0}};
+const unsigned gb_target_page_count = 0;
 uint8_t gb_timing_read(uint8_t offset) { (void)offset; assert(0); return 0; }
 void gb_timing_write(uint8_t offset, uint8_t value) { (void)offset; (void)value; assert(0); }
 uint8_t gb_video_read(uint8_t offset) { (void)offset; assert(0); return 0; }
