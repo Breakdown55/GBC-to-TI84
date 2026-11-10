@@ -12,7 +12,7 @@ enum {
 
 typedef void (*GbNativeBlock)(void);
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint16_t address;
     GbNativeBlock entry;
 } GbTarget;
@@ -23,7 +23,7 @@ typedef struct {
     unsigned count;
 } GbTargetBank;
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint16_t bank;
     uint16_t address;
     uint16_t length;

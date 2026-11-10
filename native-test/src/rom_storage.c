@@ -42,15 +42,16 @@ const uint8_t *gb_archive_pointer(uint16_t address, unsigned length)
 {
     if (address >= 0x8000 || length > 0x4000 - (address & 0x3fff)) return 0;
     unsigned bank = address < 0x4000 ? 0 : gb_rom_bank;
+#if GB_ARCHIVE_BANKS
+    return bank < GB_ROM_CHUNKS && chunks[bank] ? chunks[bank] + (address & 0x3fff) : 0;
+#else
     unsigned linear = (bank << 14) | (address & 0x3fff);
     if (linear >= GB_ROM_SIZE || length > GB_ROM_SIZE - linear) return 0;
     unsigned chunk = linear / GB_ROM_CHUNK_SIZE;
     unsigned offset = linear - chunk * GB_ROM_CHUNK_SIZE;
-#if GB_ARCHIVE_BANKS
-    if (!chunks[chunk]) return 0;
-#endif
     if (length > GB_ROM_CHUNK_SIZE - offset) return 0;
     return chunks[chunk] + offset;
+#endif
 }
 
 uint16_t gb_archive_read(uint16_t address)
