@@ -983,17 +983,25 @@ class Cartridge:
                 dispatch_targets.add(address_key(entry))
             work.append(entry)
         seen = set()
+        next_frame = deque()
+        state_count = 0
         instructions = {}
         occupied = {}
-        while work:
+        while work or next_frame:
+            if not work:
+                # Returning from VBlank can only decrease the remaining frame count.
+                # Finish this frame before visiting the next so old states can be freed.
+                work, next_frame = next_frame, work
+                seen.clear()
             state = work.popleft()
             if state in seen:
                 continue
             seen.add(state)
+            state_count += 1
             bank, _ = address_key(state)
             location = f"${bank:03X}:${state.pc:04X}"
             try:
-                if len(seen) > analysis_limit:
+                if state_count > analysis_limit:
                     raise ValueError(f"static analysis exceeded {analysis_limit:,} states")
                 if len(state.stack) > 512:
                     raise ValueError("static analysis exceeded its stack limit")
@@ -1023,23 +1031,21 @@ class Cartridge:
                 if opcode == UNSUPPORTED:
                     continue
                 successors = self.successors(state, instruction, rom_bytes, timing=timing)
-                if dispatch_targets is None:
-                    work.extend(successors)
-                    continue
-
-                if opcode == 0xe9 and join_word(*state.hl) is None:
-                    dispatch_targets.add(None)
-                if opcode in RETURNS:
-                    preview_ends = opcode == 0xd9 and state.preview_interrupt and state.preview_remaining == 1
-                    can_return = opcode not in CONDITIONAL_RET or condition_value(state, opcode) is not False
-                    if not preview_ends and can_return and join_word(
-                            self.stack_byte(state, 0), self.stack_byte(state, 1)) is None:
+                if dispatch_targets is not None:
+                    if opcode == 0xe9 and join_word(*state.hl) is None:
                         dispatch_targets.add(None)
+                    if opcode in RETURNS:
+                        preview_ends = opcode == 0xd9 and state.preview_interrupt and state.preview_remaining == 1
+                        can_return = opcode not in CONDITIONAL_RET or condition_value(state, opcode) is not False
+                        if not preview_ends and can_return and join_word(
+                                self.stack_byte(state, 0), self.stack_byte(state, 1)) is None:
+                            dispatch_targets.add(None)
                 transfer = opcode in CONTROL_TRANSFERS or opcode & 0xc7 == 0xc7
                 for successor in successors:
-                    if transfer or successor.bank != state.bank:
+                    if dispatch_targets is not None and (transfer or successor.bank != state.bank):
                         dispatch_targets.add(address_key(successor))
-                    work.append(successor)
+                    queue = next_frame if successor.preview_remaining < state.preview_remaining else work
+                    queue.append(successor)
             except ValueError as error:
                 raise ValueError(f"{location}: {error}") from error
         if stop_at is not None and stop_at not in instructions:
