@@ -341,6 +341,21 @@ class RomTest(unittest.TestCase):
         self.assertEqual(assembly.count("call .Lshared_"), 3)
         self.assertIn("ld a, (_gb_bc+1)\n    ld (_gb_a), a\n    ret", assembly)
 
+    def test_preview_shared_fault_discards_the_native_return_address(self):
+        data = cartridge_image()
+        data[0x100:0x107] = bytes.fromhex("01 a0 fe 0a 0a 0a 76")
+        assembly, _ = compile_rom(data, stop_at=(0, 0x106), vblank_preview=1)
+        self.assertIn("jp nz, .Lshared_fault", assembly)
+        self.assertIn(".Lshared_fault:\n    pop de\n    jp _gb_unmapped", assembly)
+
+    def test_rom_spans_keep_small_gaps_as_cartridge_bytes(self):
+        data = cartridge_image()
+        data[0x100:0x107] = bytes.fromhex("fa 00 03 fa 05 03 76")
+        data[0x300:0x306] = bytes(range(6))
+        _, targets = compile_rom(data)
+        self.assertIn("{0x000, 0x0300, 0x0006, 0x000000}", targets)
+        self.assertIn("0x00, 0x01, 0x02, 0x03, 0x04, 0x05,", targets)
+
     def test_live_input_keeps_the_pressed_branch_after_the_delay(self):
         data, (_, resume) = frame_rom()
         # Select buttons, then skip the marker write when A is released.

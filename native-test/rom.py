@@ -1108,9 +1108,13 @@ def checked_helper_stubs(helpers):
     return assembly
 
 
+OUTLINE_FAULT_BRANCHES = {f"jp {condition}, _gb_unmapped" for condition in ("z", "nz", "c", "nc")}
+
+
 def outline_repeated(assembly, repeated):
     """Share repeated native instruction bodies that return to their caller."""
     replacements = {}
+    needs_fault_exit = False
     for body, offsets in repeated.items():
         # Absolute guest-state loads/stores and ADL calls take at least four bytes.
         minimum = sum(4 if "_gb_" in line or line.startswith("call ") else 1
@@ -1120,7 +1124,15 @@ def outline_repeated(assembly, repeated):
         label = f".Lshared_{offsets[0]}"
         for offset in offsets:
             replacements[offset] = (f"    call {label}", len(body))
-        assembly.extend(["", f"{label}:", *(f"    {line}" for line in body), "    ret"])
+        assembly.extend(["", f"{label}:"])
+        for line in body:
+            if line in OUTLINE_FAULT_BRANCHES:
+                line = line.replace("_gb_unmapped", ".Lshared_fault")
+                needs_fault_exit = True
+            assembly.append(f"    {line}")
+        assembly.append("    ret")
+    if needs_fault_exit:
+        assembly.extend(["", ".Lshared_fault:", "    pop de", "    jp _gb_unmapped"])
     result = []
     index = 0
     while index < len(assembly):
@@ -1196,9 +1208,10 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         else:
             native, size = lower_instruction(instruction.text, pc, timing=timing,
                                              live_immediate=live_immediate, vblank_preview=vblank_preview)
-        # Blocks that can jump out on a fault must keep the original native stack.
+        # The shared fault exit unwinds its own return address before stopping the guest.
         if (vblank_preview and size is not None and not checked and not in_ram and len(native) > 1
-                and not any(line.startswith(("jp ", "ret", "djnz ")) for line in native)):
+                and all(line in OUTLINE_FAULT_BRANCHES or not line.startswith(("jp ", "ret", "djnz "))
+                        for line in native)):
             repeated.setdefault(tuple(native), []).append(len(assembly))
         assembly.extend(f"    {line}" for line in native)
         if size is not None:
@@ -1225,11 +1238,17 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     spans = []
     payload = bytearray()
     for bank, address in sorted(rom_bytes):
-        if spans and spans[-1][0] == bank and spans[-1][1] + spans[-1][2] == address:
-            spans[-1][2] += 1
-        else:
-            spans.append([bank, address, 1, len(payload)])
-        payload.append(data[bank * BANK_SIZE + address % BANK_SIZE])
+        offset = bank * BANK_SIZE + address % BANK_SIZE
+        if spans and spans[-1][0] == bank:
+            span = spans[-1]
+            gap = address - (span[1] + span[2])
+            # A span record takes nine bytes, so small gaps cost less as ROM data.
+            if gap < 9:
+                span[2] += gap + 1
+                payload.extend(data[offset - gap:offset + 1])
+                continue
+        spans.append([bank, address, 1, len(payload)])
+        payload.append(data[offset])
     data_entries = [
         f"    {{0x{bank:03x}, 0x{address:04x}, 0x{length:04x}, 0x{offset:06x}}},"
         for bank, address, length, offset in spans
