@@ -44,6 +44,8 @@ The compiler also packs nearby cartridge data ranges together and shares repeate
 
 Register arithmetic uses native eZ80 operations with Game Boy flag conversion. Plain WRAM and HRAM accesses and fixed-WRAM stack operations have native fast paths, while mapped devices retain their memory handlers. In untimed modes, recognized fill and copy loops can operate on whole contiguous ranges after checking their mappings. Timed builds retain individual instruction boundaries. Static analysis also summarizes bounded fills and can merge compatible RAM facts between frames during continuous discovery.
 
+The runtime updates its WRAM page mapping on bank switches. HALT-driven builds reuse native registers across straight-line code and check cached return continuations against the guest stack and active ROM bank. Timed builds can skip complete LY and STAT polling iterations before the next LCD or interrupt event.
+
 For a cartridge that waits at `HALT` for VBlank, build a live preview with:
 
 ```sh

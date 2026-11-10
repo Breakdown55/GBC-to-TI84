@@ -7,6 +7,16 @@ import unittest
 
 
 class RenderCacheTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("gcc"), "host gcc is required for timing tests")
+    def test_poll_skipping_respects_lcd_and_interrupt_boundaries(self):
+        root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(prefix="timing-test-", dir=root) as directory:
+            exe = Path(directory) / "timing-poll.exe"
+            subprocess.run(["gcc", "-std=c11", "-O2", "-Duint24_t=uint32_t", "-I", str(root / "src"),
+                            str(root / "tests/timing_poll.c"), str(root / "src/timing.c"), "-o", str(exe)],
+                           check=True)
+            subprocess.run([str(exe)], check=True)
+
     @unittest.skipUnless(shutil.which("gcc"), "host gcc is required for fill tests")
     def test_bulk_fill_boundaries_and_register_effects(self):
         root = Path(__file__).resolve().parent

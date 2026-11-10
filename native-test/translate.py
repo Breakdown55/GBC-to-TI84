@@ -26,18 +26,23 @@ FAULT_IF_ZERO = ["or a, a", "jp z, _gb_unmapped"]
 ROTATES = {"rlca": "rlca", "rrca": "rrca", "rla": "rla", "rra": "rra"}
 
 GUEST_LABEL = re.compile(r"_gb_[0-9a-f]{3}_[0-9a-f]{4}")
-RESIDENT_LOADS = {"ld a, (_gb_a)": "a", "ld hl, (_gb_hl)": "hl"}
-RESIDENT_STORES = {"ld (_gb_a), a": "a", "ld (_gb_hl), hl": "hl"}
+RESIDENT_REGISTERS = ("a", "bc", "de", "hl")
+RESIDENT_LOADS = {f"ld {register}, (_gb_{register})": register for register in RESIDENT_REGISTERS}
+RESIDENT_STORES = {f"ld (_gb_{register}), {register}": register for register in RESIDENT_REGISTERS}
+STATE_SLOT = re.compile(r"\(_gb_(a|bc|de|hl)(?:\+\d+)?\)")
+NATIVE_SLOT = {register: register for register in RESIDENT_REGISTERS}
+NATIVE_SLOT.update({"b": "bc", "c": "bc", "d": "de", "e": "de", "h": "hl", "l": "hl"})
 STATE_MOVE = re.compile(
-    r"ld (a|hl|[bcdehl]|\(_gb_[a-z_]+(?:\+\d+)?\)), "
-    r"(0x[0-9a-f]+|a|hl|[bcdehl]|\(_gb_[a-z_]+(?:\+\d+)?\))"
+    r"ld (bc|de|hl|[abcdehl]|\(_gb_[a-z_]+(?:\+\d+)?\)), "
+    r"(0x[0-9a-f]+|bc|de|hl|[abcdehl]|\(_gb_[a-z_]+(?:\+\d+)?\))"
 )
+WORD_STEP = re.compile(r"(?:inc|dec)\.s (bc|de|hl)")
 A_ARITHMETIC = re.compile(r"(?:add|adc|sub|sbc|and|xor|or) a, (?:[abcdehl]|0x[0-9a-f]+)")
 A_COMPARE = re.compile(r"cp a, (?:[abcdehl]|0x[0-9a-f]+)")
 
 
 def reuse_native_registers(assembly, dispatch_entries):
-    """Forward guest A and HL inside straight-line native code.
+    """Forward guest A, BC, DE and HL inside straight-line native code.
 
     Retain the last write to each guest slot at every possible entry, exit,
     or unknown helper call. A write may be removed only when a later write
@@ -74,27 +79,35 @@ def reuse_native_registers(assembly, dispatch_entries):
         move = STATE_MOVE.fullmatch(operation)
         if move:
             destination, source = move.groups()
-            # Byte reads/writes can alias the three-byte backing slot for HL.
-            if source in ("(_gb_hl)", "(_gb_hl+1)", "(_gb_hl+2)"):
-                stores.pop("hl", None)
-            if destination in ("(_gb_hl)", "(_gb_hl+1)", "(_gb_hl+2)"):
-                stores.pop("hl", None)
-                resident.discard("hl")
-            if destination in ("h", "l", "hl"):
-                resident.discard("hl")
-            if destination == "a":
-                resident.discard("a")
+            read_slot = STATE_SLOT.fullmatch(source)
+            if read_slot:
+                stores.pop(read_slot[1], None)
+            write_slot = STATE_SLOT.fullmatch(destination)
+            if write_slot:
+                stores.pop(write_slot[1], None)
+                resident.discard(write_slot[1])
+            resident.discard(NATIVE_SLOT.get(destination))
             continue
         if A_COMPARE.fullmatch(operation) or operation in ("or a, a", "and a, a"):
             continue
         if A_ARITHMETIC.fullmatch(operation) or operation in ("inc a", "dec a", "cpl", *ROTATES):
             resident.discard("a")
             continue
-        if operation in ("inc hl", "dec hl", "add.s hl, hl", "add.s hl, de",
-                         "call _gb_native_flags", "call _gb_native_step_flags"):
+        step = WORD_STEP.fullmatch(operation)
+        if step:
+            resident.discard(step[1])
+            continue
+        if operation in ("inc hl", "dec hl", "add.s hl, hl", "add.s hl, de"):
             resident.discard("hl")
             continue
+        if operation == "call _gb_native_flags":
+            resident.difference_update(("hl", "de"))
+            continue
+        if operation == "call _gb_native_step_flags":
+            resident.difference_update(("hl", "de", "bc"))
+            continue
         if operation == "call _gb_native_add16_flags":
+            resident.difference_update(("de", "bc"))
             continue
         # Branches, fault paths, arbitrary memory operations and other helpers
         # may read or replace any canonical guest state.
@@ -142,14 +155,19 @@ def high_address(operand):
     return None
 
 
-def call_sequence(address, resume, native_target):
+def call_sequence(address, resume, native_target, native_resume):
     target = native_target or f"0x{address:04x}"
     helper = "_gb_call_native" if native_target else "_gb_call"
-    return [f"ld hl, {target}", f"ld de, 0x{resume:04x}", f"jp {helper}"]
+    transfer = "jp"
+    if native_resume:
+        helper = "_gb_call_predict_native" if native_target else "_gb_call_predict"
+        transfer = "call"
+    return [f"ld hl, {target}", f"ld de, 0x{resume:04x}", f"{transfer} {helper}"]
 
 
 def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=False,
-                      vblank_preview=False, native_target=None):
+                      vblank_preview=False, native_target=None, native_resume=None,
+                      predict_returns=False):
     normalized = instruction.lower()
     parts = normalized.split()
     # A byte count advances the Game Boy PC. None ends the native block.
@@ -177,9 +195,9 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             return [*call_with_arg("gb_step_hl", decrement), *FAULT_IF_ZERO], 1
     if len(parts) == 2 and parts[0] in ("inc", "dec") and parts[1] in ("bc", "de", "hl", "sp"):
         operation, register = parts
+        native = "hl" if register == "sp" else register
         return [
-            f"ld hl, (_gb_{register})", f"{operation} hl", f"ld (_gb_{register}), hl",
-            "xor a, a", f"ld (_gb_{register}+2), a",
+            f"ld {native}, (_gb_{register})", f"{operation}.s {native}", f"ld (_gb_{register}), {native}",
         ], 1
     sp_offset = re.fullmatch(r"ld\s+hl\s*,\s*sp([+-])\$([0-9a-f]{1,2})", normalized)
     if sp_offset:
@@ -270,7 +288,8 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             operand = f"(_gb_hram+{pc + 1 - 0xff80})" if live_immediate else f"0x{value:02x}"
             return [f"ld a, {operand}", f"ld ({BYTE_REGISTERS[register]}), a"], 2
         if register in ("bc", "de", "hl", "sp"):
-            return [f"ld hl, 0x{value:04x}", f"ld (_gb_{register}), hl"], 3
+            native = "hl" if register == "sp" else register
+            return [f"ld {native}, 0x{value:04x}", f"ld (_gb_{register}), {native}"], 3
     indirect_store = re.fullmatch(r"ld\s+\[hl([+-]?)\]\s*,\s*a", normalized)
     if indirect_store:
         helper = {"": "gb_fast_store_hl", "+": "gb_fast_store_hli", "-": "gb_fast_store_hld"}[indirect_store[1]]
@@ -341,7 +360,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
                 "call _gb_fast_pop", "jp c, _gb_unmapped", *store_word,
             ], 1
     if parts == ["ret"]:
-        return ["jp _gb_ret"], None
+        return ["jp _gb_ret_predict" if predict_returns else "jp _gb_ret"], None
     if parts == ["reti"]:
         if vblank_preview:
             return ["jp _gb_preview_reti"], None
@@ -358,7 +377,8 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
                 "ld a, (_gb_f)", f"bit {bit}, a", f"jr {opposite}, 1f",
                 "ld a, 12", "ld (_gb_timing_extra), a", "jp _gb_ret", "1:",
             ], 1
-        return ["ld a, (_gb_f)", f"bit {bit}, a", f"jp {condition}, _gb_ret"], 1
+        target = "_gb_ret_predict" if predict_returns else "_gb_ret"
+        return ["ld a, (_gb_f)", f"bit {bit}, a", f"jp {condition}, {target}"], 1
     if parts == ["halt"]:
         if timing or vblank_preview:
             if pc is None:
@@ -378,7 +398,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             if pc is None:
                 raise ValueError(f"{parts[0].upper()} needs an address-bearing entry label like gb_000_0800")
             return_address = (pc + (1 if parts[0] == "rst" else 3)) & 0xffff
-            return call_sequence(address, return_address, native_target), None
+            return call_sequence(address, return_address, native_target, native_resume), None
     conditional_jump = re.fullmatch(r"(jr|jp|call)\s+(nz|z|nc|c)\s*,\s*(\S+)", normalized)
     if conditional_jump:
         operation, condition, target = conditional_jump.groups()
@@ -397,7 +417,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             if operation == "call":
                 return [
                     "ld a, (_gb_f)", f"bit {bit}, a", f"jr {native_condition}, 1f", *taken,
-                    *call_sequence(address, fallthrough, native_target), "1:",
+                    *call_sequence(address, fallthrough, native_target, native_resume), "1:",
                 ], 3
             return [
                 f"ld hl, 0x{fallthrough:04x}",

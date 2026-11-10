@@ -336,6 +336,49 @@ static uint8_t pending_interrupts(void)
     return gb_if & gb_ie & IRQ_MASK;
 }
 
+/* Skip complete 32-cycle LDH/compare/JR iterations before the next event.
+ * The ordinary instruction boundaries still handle the transition itself. */
+void gb_timing_skip_poll(uint24_t rule)
+{
+    if (!gb_timing_flush() || gb_host_quit || ime_delay ||
+        !(gb_lcdc & LCD_ENABLED) || (gb_ime && pending_interrupts())) return;
+
+    uint8_t fast = double_speed();
+    unsigned limit = (next_lcd_dot() - dot) << fast;
+    if (gb_ime && (gb_ie & IRQ_TIMER)) {
+        if (reload_cycles) return;
+        if (gb_tac & 4) {
+            unsigned period = timer_period();
+            uint24_t overflow = period - (divider & (period - 1))
+                               + (uint24_t)(255 - tima) * period;
+            if (overflow < limit) limit = overflow;
+        }
+    }
+    if (limit <= 32) return;
+
+    uint8_t argument = rule;
+    uint8_t a, flags;
+    if (rule & 0x800) {
+        a = gb_timing_read(0x41);
+        flags = (gb_f & 0x10) | 0x20 | ((a & argument) == 0 ? 0x80 : 0);
+    } else if (rule & 0x400) {
+        a = gb_timing_read(0x41) & argument;
+        flags = 0x20 | (a == 0 ? 0x80 : 0);
+    } else {
+        a = gb_timing_read(0x44);
+        flags = 0x40 | (a == argument ? 0x80 : 0) | (a < argument ? 0x10 : 0)
+              | ((a & 15) < (argument & 15) ? 0x20 : 0);
+    }
+    uint8_t condition = (rule >> 8) & 3;
+    uint8_t bit = condition & 2 ? 0x10 : 0x80;
+    if (!!(flags & bit) != (condition & 1)) return;
+
+    unsigned cycles = (limit - 1) & ~31U;
+    advance(cycles > 224 ? 224 : cycles, fast, 0);
+    gb_a = a;
+    gb_f = flags;
+}
+
 static uint24_t service_interrupt(uint24_t pc, uint8_t pending)
 {
     uint8_t vector = 0x40, mask = 1;

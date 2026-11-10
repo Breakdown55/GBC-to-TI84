@@ -320,6 +320,23 @@ class RomTest(unittest.TestCase):
         self.assertIn((2, 0x4003), instructions)
         self.assertNotIn((1, 0x4003), instructions)
 
+    def test_predicted_call_uses_adjacent_native_continuation(self):
+        data = cartridge_image()
+        data[0x100:0x107] = bytes.fromhex("31 00 d0 cd 00 02 76")
+        data[0x200] = 0xc9
+        assembly, _ = compile_rom(data, stop_at=(0, 0x106), vblank_preview=1)
+        self.assertIn("call _gb_call_predict_native\n\n    .global _gb_000_0106", assembly)
+        self.assertIn("jp _gb_ret_predict", assembly)
+
+    def test_lcd_poll_only_skips_in_timed_translation(self):
+        data = cartridge_image()
+        data[0x100:0x107] = bytes.fromhex("f0 44 fe 90 20 fa 76")
+        timed, _ = compile_rom(data, timing=True, stop_at=(0, 0x106))
+        self.assertIn("ld hl, 0x0090\n    push hl\n    call _gb_timing_skip_poll", timed)
+        self.assertIn("call _gb_boundary", timed)
+        untimed, _ = compile_rom(data)
+        self.assertNotIn("call _gb_timing_skip_poll", untimed)
+
     def test_runtime_target_is_discovered_from_known_stack_bytes(self):
         self.assertIn((2, 0x4321), Cartridge(indirect_rom()).discover())
 

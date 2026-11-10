@@ -47,6 +47,8 @@ volatile uint8_t gb_ime;
 uint8_t gb_vram[2][GB_VRAM_SIZE];
 uint8_t gb_wram[GB_WRAM_SIZE];
 uint8_t gb_wram_banks[7][GB_WRAM_SIZE];
+/* The two 4 KiB WRAM pages are also visible through the echo window. */
+uint8_t *gb_wram_pages[2] = {gb_wram, gb_wram_banks[0]};
 uint8_t gb_hram[GB_HRAM_SIZE];
 uint8_t gb_lcdc;
 uint8_t gb_ly;
@@ -475,6 +477,7 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
     case 0x70:
         if (gb_cgb) {
             gb_svbk = value & 7;
+            gb_wram_pages[1] = gb_wram_banks[gb_svbk ? gb_svbk - 1 : 0];
         }
         break;
     case 0xff:
@@ -514,11 +517,8 @@ static uint8_t *work_or_high_ram_byte(uint24_t address)
     }
     if (address >= GB_WRAM_BASE && address < GB_WRAM_BASE + 2 * GB_WRAM_SIZE) {
         unsigned offset = address - GB_WRAM_BASE;
-        if (offset < GB_WRAM_SIZE) {
-            return &gb_wram[offset];
-        }
-        unsigned bank = gb_cgb && gb_svbk ? gb_svbk : 1;
-        return &gb_wram_banks[bank - 1][offset - GB_WRAM_SIZE];
+        if (offset < GB_WRAM_SIZE) return gb_wram + offset;
+        return gb_wram_pages[1] + (offset - GB_WRAM_SIZE);
     }
     if (address >= GB_HRAM_BASE && address < GB_HRAM_BASE + GB_HRAM_SIZE) {
         return &gb_hram[address - GB_HRAM_BASE];

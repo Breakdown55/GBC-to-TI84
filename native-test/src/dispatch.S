@@ -89,23 +89,7 @@ _gb_write_indirect:
 .Lbanked_ram:
     and a, 0x0f
     ld h, a
-    ld a, (_gb_cgb)
-    or a, a
-    ld a, 1
-    jr z, .Lram_bank
-    ld a, (_gb_svbk)
-    or a, a
-    jr nz, .Lram_bank
-    inc a
-.Lram_bank:
-    dec a
-    rlca
-    rlca
-    rlca
-    rlca
-    add a, h
-    ld h, a
-    ld de, _gb_wram_banks
+    ld de, (_gb_wram_pages+3)
     add hl, de
     or a, a
     ret
@@ -261,6 +245,115 @@ _gb_dispatch:
     sbc hl, de
     jp z, _gb_missing_target
     jp (hl)
+
+    .section .bss.gb_return_cache,"aw",@nobits
+    .balign 256
+.Lreturn_cache:
+    .space 128
+
+    .section .text.gb_return_prediction
+    .global _gb_call_predict
+    .global _gb_call_predict_native
+    .global _gb_ret_predict
+
+/* The native CALL supplies the address of the immediately following code.
+ * Entries are indexed by guest SP after return and also store PC and bank. */
+_gb_call_predict:
+    pop bc
+    call .Lremember_call
+    jp z, _gb_unmapped
+    jp _gb_dispatch
+_gb_call_predict_native:
+    pop bc
+    call .Lremember_call
+    jp z, _gb_unmapped
+    jp (hl)
+.Lremember_call:
+    push hl
+    push bc
+    push de
+    call .Lpush_guest_de
+    pop de
+    pop bc
+    or a, a
+    jr z, .Lremember_done
+    ld a, (_gb_sp)
+    add a, 2
+    and a, 0x1e
+    rlca
+    rlca
+    ld hl, .Lreturn_cache
+    ld l, a
+    ld (hl), bc
+    inc hl
+    inc hl
+    inc hl
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    inc hl
+    ld a, d
+    and a, 0xc0
+    cp a, 0x40
+    ld de, 0
+    jr nz, .Lremember_bank
+    ld de, (_gb_rom_bank)
+.Lremember_bank:
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    ld a, 1
+    or a, a
+.Lremember_done:
+    pop hl
+    ret
+
+_gb_ret_predict:
+    call _gb_fast_pop
+    jp c, _gb_unmapped
+    ld (_gb_pc), hl
+    ld d, h
+    ld e, l
+    ld a, (_gb_sp)
+    and a, 0x1e
+    rlca
+    rlca
+    ld hl, .Lreturn_cache
+    ld l, a
+    ld bc, (hl)
+    inc hl
+    inc hl
+    inc hl
+    ld a, (hl)
+    cp a, e
+    jr nz, .Lreturn_miss
+    inc hl
+    ld a, (hl)
+    cp a, d
+    jr nz, .Lreturn_miss
+    ld a, d
+    and a, 0xc0
+    cp a, 0x40
+    jr nz, .Lreturn_valid_bank
+    inc hl
+    ld a, (_gb_rom_bank)
+    cp a, (hl)
+    jr nz, .Lreturn_miss
+    inc hl
+    ld a, (_gb_rom_bank+1)
+    cp a, (hl)
+    jr nz, .Lreturn_miss
+.Lreturn_valid_bank:
+    push bc
+    pop hl
+    ld bc, 0
+    or a, a
+    sbc hl, bc
+    jr z, .Lreturn_miss
+    jp (hl)
+.Lreturn_miss:
+    ld hl, (_gb_pc)
+    jp _gb_dispatch
 
     .section .text.gb_fast_stack
     .global _gb_fast_push

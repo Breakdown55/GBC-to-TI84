@@ -24,7 +24,8 @@ int main(void)
 {
     const unsigned addresses[] = {0x8000,0x9fff,0xc000,0xcfff,0xd000,0xdfff,0xe000,0xefff,0xf000,0xfdff,0xff80,0xfffe};
     const unsigned counts[] = {0,1,2,255};
-    gb_cgb = 1; gb_svbk = 7; gb_vbk = 1;
+    gb_cgb = 1; gb_a = 7; gb_vbk = 1;
+    assert(gb_write_high(0x70));
     for(unsigned use_b=0;use_b<2;use_b++)
     for(unsigned i=0;i<sizeof addresses/sizeof *addresses;i++)
     for(unsigned j=0;j<sizeof counts/sizeof *counts;j++) {
@@ -74,4 +75,12 @@ int main(void)
     gb_timing_enabled=1;gb_hl=0xc000;gb_bc=1;assert(!gb_fill_hl(0));assert(gb_bc==1);
     gb_de = 0xc100;
     assert(!gb_copy_hl_de(1));
+
+    gb_timing_enabled = 0;
+    gb_wram_banks[0][0] = 0x12;
+    gb_wram_banks[6][0] = 0x34;
+    assert(gb_watch_ram(0xd000) == 0x34 && gb_watch_ram(0xf000) == 0x34);
+    gb_a = 0;
+    assert(gb_write_high(0x70));
+    assert(gb_watch_ram(0xd000) == 0x12 && gb_watch_ram(0xf000) == 0x12);
 }

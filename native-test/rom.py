@@ -1322,9 +1322,29 @@ def copy_loop(bank, pc, instructions, ram_code):
     return layout, cursor + 1, end
 
 
+def lcd_poll_rule(bank, pc, instructions, ram_code):
+    """Encode a side-effect-free LY/STAT poll followed by a branch back."""
+    if pc // BANK_SIZE != (pc + 5) // BANK_SIZE or any(pc + i in ram_code for i in range(6)):
+        return None
+    read, test, branch = (instructions.get((bank, pc + i)) for i in (0, 2, 4))
+    if (read is None or read.opcode != 0xf0 or test is None or branch is None
+            or branch.opcode not in CONDITIONAL_JR or branch.operand != pc):
+        return None
+    condition = (branch.opcode - 0x20) >> 3
+    if read.operand == 0x44 and test.opcode == 0xfe:
+        return (condition << 8) | test.operand
+    if read.operand == 0x41 and test.opcode == 0xe6 and condition < 2:
+        return 0x400 | (condition << 8) | test.operand
+    if (read.operand == 0x41 and test.opcode == 0xcb and test.operand & 0xc7 == 0x47
+            and condition < 2):
+        return 0x800 | (condition << 8) | (1 << ((test.operand >> 3) & 7))
+    return None
+
+
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
-                analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=()):
+                analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=(),
+                predict_returns=True):
     if continuous and not vblank_preview:
         raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
@@ -1349,6 +1369,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     fallback_addresses = set()
     helpers = set()
     repeated = {}
+    predicted_entries = set()
+    predict_returns = predict_returns and bool(vblank_preview) and not timing
     ordered = sorted(instructions.items())
     bulk_loops = {}
     bulk_backedges = {}
@@ -1368,7 +1390,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                     layout, backedge, end = copy
                     bulk_loops[bank, pc] = "copy_hl_de", layout, end
                     bulk_backedges[bank, backedge] = pc
-    for (bank, pc), instruction in ordered:
+    for index, ((bank, pc), instruction) in enumerate(ordered):
         name = symbol(bank, pc)
         targets.append(f"extern void {name}(void);")
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
@@ -1381,6 +1403,10 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             ])
         opcode = instruction.opcode
         in_ram = pc in cartridge.ram_code
+        poll = lcd_poll_rule(bank, pc, instructions, cartridge.ram_code) if timing and opcode == 0xf0 else None
+        if poll is not None:
+            assembly.extend([f"    ld hl, 0x{poll:04x}", "    push hl",
+                             "    call _gb_timing_skip_poll", "    pop de"])
         fixed = None if in_ram else fixed_memory_access(data, instruction)
         checked = CHECKED_HELPERS.get(opcode) if not timing and not in_ram and fixed is None else None
         cb_memory = opcode == 0xcb and instruction.operand & 7 == 6
@@ -1429,15 +1455,23 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             size = instruction.size
         else:
             callee = None
+            continuation = None
             if opcode in (0xcd, *CONDITIONAL_CALL) or opcode & 0xc7 == 0xc7:
                 target = native_destination(bank, pc, instruction.operand, instructions)
                 if target is not None:
                     callee = f"_{symbol(*target)}"
+                if predict_returns and not in_ram:
+                    resume = native_destination(bank, pc, pc + instruction.size, instructions)
+                    if resume is not None and index + 1 < len(ordered) and ordered[index + 1][0] == resume:
+                        continuation = f"_{symbol(*resume)}"
+                        predicted_entries.add(continuation)
             native, size = lower_instruction(instruction.text, pc, timing=timing,
                                              live_immediate=live_immediate, vblank_preview=vblank_preview,
-                                             native_target=callee)
+                                             native_target=callee, native_resume=continuation,
+                                             predict_returns=predict_returns)
         # The shared fault exit unwinds its own return address before stopping the guest.
-        if (vblank_preview and size is not None and not checked and not in_ram and len(native) > 1
+        if (vblank_preview and size is not None and not checked and not in_ram
+                and not any(line.startswith("call _gb_call_predict") for line in native) and len(native) > 1
                 and all(line in OUTLINE_FAULT_BRANCHES or not line.startswith(("jp ", "ret", "djnz "))
                         for line in native)):
             repeated.setdefault(tuple(native), []).append(len(assembly))
@@ -1464,7 +1498,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         entry_labels.append(f"_{symbol(bank, pc)}")
         entries.append(f"    {{0x{pc:04x}, {symbol(bank, pc)}}},")
     if vblank_preview and not timing:
-        reuse_native_registers(assembly, entry_labels)
+        reuse_native_registers(assembly, predicted_entries.union(entry_labels))
     if repeated:
         assembly = outline_repeated(assembly, repeated)
     spans = []
