@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 
 from rom import DEFAULT_ANALYSIS_LIMIT, compile_rom
+from rom_storage import cartridge_chunks, storage_metadata, CHUNK_SIZE
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -72,7 +73,7 @@ def guard_compressed_program(run, work):
     path.write_bytes(program)
 
 
-def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0):
+def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, archive_size=0):
     def run(tool, *args):
         subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
 
@@ -92,6 +93,7 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0):
         ("timing", PROJECT / "src/timing.c"),
         ("render", PROJECT / "src/render.c"),
         ("vram_dma", PROJECT / "src/vram_dma.c"),
+        ("rom_storage", PROJECT / "src/rom_storage.c"),
         ("targets", work / "targets.c"),
     )
     for unit, source in sources:
@@ -100,6 +102,8 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0):
             "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}",
             f"-DGB_LIVE={int(input_after is not None)}", f"-DGB_INPUT_AFTER={input_after or 0}", "-nostdinc",
             f"-DGB_FRAME_SKIP={frame_skip}",
+            f"-DGB_ROM_CHUNKS={(archive_size + CHUNK_SIZE - 1) // CHUNK_SIZE}", f"-DGB_ROM_SIZE={archive_size}",
+            f"-DGB_ROM_CHUNK_SIZE={CHUNK_SIZE}",
             "-isystem", ce / "include", "-I", PROJECT / "src",
             source, "-o", f"{unit}.s")
         run(assembler, "-march=ez80+full", f"{unit}.s", "-o", f"{unit}.o")
@@ -196,6 +200,8 @@ def main():
     parser.add_argument("--analysis-limit", type=int, default=DEFAULT_ANALYSIS_LIMIT,
                         help="maximum number of analysis states (default: %(default)s)")
     parser.add_argument("--analysis-progress", action="store_true", help="report static discovery progress")
+    parser.add_argument("--archive-rom", action="store_true",
+                        help="also package the full cartridge as archived AppVars for data reads beyond traced spans")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
@@ -226,25 +232,38 @@ def main():
     def progress(states, instructions, frames):
         print(f"Analysis: {states:,} states, {instructions:,} instructions, {frames} VBlanks", flush=True)
     try:
-        assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at,
+        cartridge_data = args.rom.read_bytes()
+        assembly, table = compile_rom(cartridge_data, args.entry, args.watch or 0, args.stop_at,
                                       timing=timing, trap_unsupported=args.trap_unsupported,
                                       ram_code=args.ram_code, vblank_preview=preview_frames,
                                       input_after=input_after, analysis_limit=args.analysis_limit,
                                       continuous=args.vblank_run,
                                       progress=progress if args.analysis_progress else None)
+        if args.archive_rom:
+            table += storage_metadata(cartridge_data)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:
             work = Path(directory)
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
-            archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after, args.frame_skip)
+            archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after, args.frame_skip,
+                             len(cartridge_data) if args.archive_rom else 0)
+            if args.archive_rom:
+                directory = output.parent / f"{args.name}-data"
+                directory.mkdir(exist_ok=True)
+                for name, contents in cartridge_chunks(cartridge_data):
+                    staged = work / f"{name}.8xv"
+                    staged.write_bytes(contents)
+                    os.replace(staged, directory / staged.name)
             os.replace(work / "program.8xp", output)
             os.replace(work / "program.map", output.with_suffix(".map"))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"{error}\n")
     print(output)
     print(f"Transfer destination: {'Archive' if archived else 'RAM'}")
+    if args.archive_rom:
+        print(f"Send every .8xv in {directory} to Archive before running.")
 
 
 if __name__ == "__main__":

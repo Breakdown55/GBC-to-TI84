@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "rom_storage.h"
 #include "render.h"
 #include "timing.h"
 #include "vram_dma.h"
@@ -10,7 +11,6 @@ enum {
     GB_FLAG_N = 0x40,
     GB_FLAG_H = 0x20,
     GB_FLAG_C = 0x10,
-    GB_UNMAPPED_BYTE = 0x100,
     SRAM_PAGE_SIZE = 64,
     SRAM_PAGE_LIMIT = 96,
     SRAM_PAGE_COUNT = 0x20000 / SRAM_PAGE_SIZE,
@@ -598,6 +598,9 @@ const uint8_t *gb_read_contiguous(uint16_t address, unsigned length)
         if (span && length <= span->length - (address - span->address)) {
             return gb_rom_payload + span->offset + (address - span->address);
         }
+#if GB_ROM_CHUNKS
+        return gb_archive_pointer(address, length);
+#endif
     } else if (address >= GB_WRAM_BASE && address < 0xe000 &&
                length <= GB_WRAM_SIZE - (address & (GB_WRAM_SIZE - 1))) {
         return work_or_high_ram_byte(address);
@@ -689,6 +692,9 @@ static uint16_t read_memory(uint24_t address)
 {
     if (address < 0x8000) {
         const GbRomSpan *span = find_rom_span((uint16_t)address);
+#if GB_ROM_CHUNKS
+        if (!span) return gb_archive_read((uint16_t)address);
+#endif
         return span ? gb_rom_payload[span->offset + address - span->address] : GB_UNMAPPED_BYTE;
     }
     uint8_t *byte = ram_byte(address);

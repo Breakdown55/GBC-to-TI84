@@ -2,6 +2,7 @@
 #include "render.h"
 #include "show_hex.h"
 #include "timing.h"
+#include "rom_storage.h"
 
 #ifndef GB_FRAME_SKIP
 #define GB_FRAME_SKIP 0
@@ -137,6 +138,18 @@ uint8_t gb_preview_finish(void)
 
 int main(void)
 {
+#if GB_ROM_CHUNKS
+    /* Resolve archive addresses before guest state or graphics become active.
+     * No variable allocation or archival occurs while these pointers are live. */
+    if (!gb_archive_init()) {
+        os_ClrHome();
+        os_PutStrFull("Archive ROM data:");
+        os_NewLine();
+        os_PutStrFull(gb_archive_name);
+        while (!os_GetCSC()) {}
+        return 1;
+    }
+#endif
     static const uint24_t ram_sizes[] = {0, 0x800, 0x2000, 0x8000, 0x20000, 0x10000};
     gb_rom_bank_mask = rom_bank_mask;
     gb_rom_bank = 1;

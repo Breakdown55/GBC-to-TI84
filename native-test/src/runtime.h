@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 enum {
+    GB_UNMAPPED_BYTE = 0x100,
     GB_VRAM_BASE = 0x8000, GB_VRAM_SIZE = 0x2000,
     GB_WRAM_BASE = 0xc000, GB_WRAM_SIZE = 0x1000,
     GB_HRAM_BASE = 0xff80, GB_HRAM_SIZE = 0x7f,
