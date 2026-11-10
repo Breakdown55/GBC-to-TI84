@@ -12,6 +12,7 @@ extern const uint16_t rom_watch_address;
 extern const uint8_t rom_mbc5;
 extern const uint8_t rom_cgb;
 extern const uint8_t rom_timing;
+extern const unsigned rom_preview_frames;
 extern const uint8_t rom_ram_size_code;
 extern const GbRomSpan gb_rom_spans[];
 extern const uint8_t gb_rom_bytes[];
@@ -19,6 +20,8 @@ extern const unsigned gb_rom_span_count;
 extern void gb_000_0100(void);
 
 volatile uint8_t gb_run_status;
+static unsigned preview_frames_left;
+static uint8_t preview_in_handler;
 
 void gb_halt(void)
 {
@@ -38,6 +41,28 @@ void gb_missing_target(void)
 void gb_checkpoint(void)
 {
     gb_run_status = RUN_CHECKPOINT;
+}
+
+uint8_t gb_preview_begin(uint24_t resume)
+{
+    if (preview_in_handler || !(gb_lcdc & 0x80) || !(gb_ie & 1) || !gb_ime || !gb_push_word(resume)) {
+        return 0;
+    }
+    preview_in_handler = 1;
+    ++gb_frame_count;
+    gb_ly = 144;
+    gb_if &= (uint8_t)~1;
+    gb_di();
+    return 1;
+}
+
+uint8_t gb_preview_finish(void)
+{
+    if (!preview_in_handler) {
+        return 0;
+    }
+    preview_in_handler = 0;
+    return --preview_frames_left == 0;
 }
 
 int main(void)
@@ -62,13 +87,14 @@ int main(void)
     gb_nr52 = 0x80;
     gb_pc = 0x0100;
     gb_video_init();
+    preview_frames_left = rom_preview_frames;
     gb_timing_enabled = rom_timing;
     if (gb_timing_enabled) {
         gb_timing_init();
     }
     gb_000_0100();
-    if (gb_timing_enabled) {
-        gb_timing_flush();
+    if (gb_timing_enabled && !gb_timing_flush()) {
+        gb_unmapped();
     }
 
     /* TI-OS display calls can reuse scratch RAM backing the guest state. */
@@ -84,7 +110,7 @@ int main(void)
     }
 #endif
     uint16_t pc = gb_pc;
-    uint16_t bank = pc < 0x4000 ? 0 : gb_rom_bank;
+    uint16_t bank = pc >= 0x4000 && pc < 0x8000 ? gb_rom_bank : 0;
     uint16_t address = rom_watch_address;
     uint8_t value = address ? gb_watch_ram(address) : 0;
 

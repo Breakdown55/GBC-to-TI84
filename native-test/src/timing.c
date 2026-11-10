@@ -1,5 +1,6 @@
 #include "timing.h"
 #include "runtime.h"
+#include "vram_dma.h"
 
 enum {
     IRQ_VBLANK = 1, IRQ_STAT = 2, IRQ_TIMER = 4, IRQ_MASK = 0x1f,
@@ -7,6 +8,7 @@ enum {
     MODE_2_END = 80, MODE_3_END = 252, LINE_DOTS = 456,
     HALT_WAIT_LIMIT = LINE_DOTS * TOTAL_LINES * 4,
     HALT_MAX_STEP = 252,
+    STALL_MAX_DOTS = 124,
     DISPATCH_NONE = 0, DISPATCH_FAULT = 1, DISPATCH_HALTED = 2,
 };
 
@@ -18,6 +20,8 @@ uint24_t gb_frame_count;
 static uint8_t staged_cycles;
 static uint8_t staged_double_speed;
 static uint8_t ime_delay;
+static uint8_t timing_fault;
+static uint16_t stalled_dots;
 
 static uint16_t divider;
 static uint8_t tima;
@@ -27,6 +31,7 @@ static uint16_t dot;
 static uint8_t line;
 static uint8_t mode;
 static uint8_t stat_signal;
+static uint8_t hblank_used;
 
 static uint8_t double_speed(void)
 {
@@ -102,7 +107,7 @@ static uint16_t next_lcd_dot(void)
     return LINE_DOTS;
 }
 
-static void advance_lcd(uint8_t dots)
+static void advance_lcd(uint16_t dots, uint8_t fast, uint8_t halted)
 {
     if (!(gb_lcdc & LCD_ENABLED)) {
         return;
@@ -118,6 +123,7 @@ static void advance_lcd(uint8_t dots)
         dot = end;
         if (end == LINE_DOTS) {
             dot = 0;
+            hblank_used = 0;
             if (++line == TOTAL_LINES) {
                 line = 0;
             }
@@ -133,19 +139,52 @@ static void advance_lcd(uint8_t dots)
             mode = mode == 2 ? 3 : 0;
         }
         update_stat();
+        if (!mode && !halted) {
+            uint8_t result = gb_vram_dma_hblank();
+            if (result == GB_VRAM_DMA_FAULT) {
+                timing_fault = 1;
+                return;
+            }
+            if (result == GB_VRAM_DMA_COPIED) {
+                hblank_used = 1;
+                dots += GB_VRAM_DMA_BLOCK_DOTS;
+                advance_timer(GB_VRAM_DMA_BLOCK_DOTS << fast);
+            }
+        }
     }
 }
 
-static void advance(uint8_t cycles, uint8_t fast)
+static void advance(uint8_t cycles, uint8_t fast, uint8_t halted)
 {
     advance_timer(cycles);
-    advance_lcd(fast ? cycles >> 1 : cycles);
+    advance_lcd(cycles >> fast, fast, halted);
+}
+
+uint8_t gb_timing_claim_hblank(void)
+{
+    if (!(gb_lcdc & LCD_ENABLED)) {
+        return 1;
+    }
+    if (mode || hblank_used) {
+        return 0;
+    }
+    hblank_used = 1;
+    return 1;
+}
+
+void gb_timing_stall(uint16_t dots)
+{
+    if (gb_timing_enabled) {
+        stalled_dots += dots;
+    }
 }
 
 void gb_timing_init(void)
 {
     staged_cycles = 0;
     staged_double_speed = 0;
+    stalled_dots = 0;
+    timing_fault = 0;
     gb_timing_extra = 0;
     gb_frame_count = 0;
     gb_di();
@@ -157,6 +196,8 @@ void gb_timing_init(void)
     gb_ly = 0;
     mode = (gb_lcdc & LCD_ENABLED) ? 2 : 0;
     stat_signal = 0;
+    hblank_used = 0;
+    gb_vram_dma_reset();
     update_stat();
 }
 
@@ -214,10 +255,19 @@ void gb_timing_write(uint8_t offset, uint8_t value)
         uint8_t previous = gb_lcdc;
         gb_lcdc = value;
         if ((previous ^ value) & LCD_ENABLED) {
+            if (!(value & LCD_ENABLED) && mode) {
+                uint8_t result = gb_vram_dma_hblank();
+                if (result == GB_VRAM_DMA_FAULT) {
+                    timing_fault = 1;
+                } else if (result == GB_VRAM_DMA_COPIED) {
+                    gb_timing_stall(GB_VRAM_DMA_BLOCK_DOTS);
+                }
+            }
             dot = 0;
             line = 0;
             gb_ly = 0;
             mode = (value & LCD_ENABLED) ? 2 : 0;
+            hblank_used = 0;
             update_stat();
         }
         break;
@@ -252,17 +302,27 @@ void gb_timing_enable_ime(void)
     ime_delay = 0;
 }
 
-void gb_timing_flush(void)
+uint8_t gb_timing_flush(void)
 {
     uint8_t cycles = staged_cycles + gb_timing_extra;
     staged_cycles = 0;
     gb_timing_extra = 0;
     if (cycles) {
-        advance(cycles, staged_double_speed);
+        advance(cycles, staged_double_speed, 0);
         if (ime_delay && !--ime_delay) {
             gb_ime = 1;
         }
     }
+    if (!stalled_dots || timing_fault) {
+        return !timing_fault;
+    }
+    uint8_t fast = double_speed();
+    do {
+        uint8_t dots = stalled_dots > STALL_MAX_DOTS ? STALL_MAX_DOTS : stalled_dots;
+        stalled_dots -= dots;
+        advance(dots << fast, fast, 0);
+    } while (stalled_dots && !timing_fault);
+    return !timing_fault;
 }
 
 static uint8_t pending_interrupts(void)
@@ -282,14 +342,16 @@ static uint24_t service_interrupt(uint24_t pc, uint8_t pending)
     if (!gb_push_word(pc)) {
         return DISPATCH_FAULT;
     }
-    advance(20, double_speed());
-    return vector;
+    advance(20, double_speed(), 0);
+    return timing_fault ? DISPATCH_FAULT : vector;
 }
 
 uint24_t gb_timing_boundary(uint24_t pc, uint24_t cycles)
 {
     gb_pc = pc;
-    gb_timing_flush();
+    if (!gb_timing_flush()) {
+        return DISPATCH_FAULT;
+    }
     uint8_t pending = pending_interrupts();
     if (gb_ime && pending) {
         return service_interrupt(pc, pending);
@@ -328,13 +390,17 @@ uint24_t gb_timing_halt(uint24_t resume)
     if (pending && !gb_ime) {
         if (ime_delay == 1) {
             /* EI followed by HALT returns to the HALT after the handler. */
-            gb_timing_flush();
+            if (!gb_timing_flush()) {
+                return DISPATCH_FAULT;
+            }
             return service_interrupt((uint16_t)(resume - 1), pending);
         }
         /* The duplicated-fetch HALT bug needs a separate decoder path. */
         return DISPATCH_FAULT;
     }
-    gb_timing_flush();
+    if (!gb_timing_flush()) {
+        return DISPATCH_FAULT;
+    }
     uint8_t sources = 0;
     if (gb_lcdc & LCD_ENABLED) {
         sources |= IRQ_VBLANK;
@@ -354,7 +420,7 @@ uint24_t gb_timing_halt(uint24_t resume)
     /* Two double-speed LCD frames also exceed the longest timer overflow. */
     for (uint24_t elapsed = 0; !pending && elapsed < HALT_WAIT_LIMIT;) {
         uint8_t cycles = halt_step(sources, fast);
-        advance(cycles, fast);
+        advance(cycles, fast, 1);
         elapsed += cycles;
         pending = pending_interrupts();
     }

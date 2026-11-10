@@ -1,8 +1,9 @@
 """Discover reachable instructions in a cartridge and emit native code and targets."""
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass, replace
+from itertools import groupby
 from typing import Optional
 
 from translate import dispatch, lower_instruction
@@ -10,10 +11,15 @@ from translate import dispatch, lower_instruction
 
 BANK_SIZE = 0x4000
 ENTRY = 0x0100
+HRAM_BASE = 0xff80
+HRAM_END = 0xffff
+VRAM_BASE = 0x8000
+VRAM_SIZE = 0x2000
 CHECKPOINT = -1
 UNSUPPORTED = -2
 SRAM_BASE = 0x10000
 WRAM_BANKS_BASE = 0x30000
+VRAM_BANKS_BASE = 0x40000
 UNKNOWN_SRAM_BYTE = -1
 
 IMPLIED = {
@@ -59,6 +65,14 @@ CONDITIONAL_JR = (0x20, 0x28, 0x30, 0x38)
 CONDITIONAL_JP = (0xc2, 0xca, 0xd2, 0xda)
 CONDITIONAL_CALL = (0xc4, 0xcc, 0xd4, 0xdc)
 CONDITIONAL_RET = (0xc0, 0xc8, 0xd0, 0xd8)
+CONTROL_TRANSFERS = {
+    0x18, 0x76, 0xc3, 0xcd, 0xe9, *CONDITIONAL_JR, *CONDITIONAL_JP, *CONDITIONAL_CALL, *RETURNS,
+}
+CHECKED_HELPERS = {
+    0x10: ("stop", False), 0x22: ("store_hli", False), 0x2a: ("load_hli", False),
+    0x32: ("store_hld", False), 0x3a: ("load_hld", False), 0x77: ("store_hl", False),
+    0xe0: ("write_high", True), 0xea: ("store_a", True), 0xfa: ("load_a", True),
+}
 ALU_NAMES = ("add", "adc", "sub", "sbc", "and", "xor", "or", "cp")
 ALU_IMMEDIATE = (0xc6, 0xce, 0xd6, 0xde, 0xe6, 0xee, 0xf6, 0xfe)
 SHIFTS = ("rlc", "rrc", "rl", "rr", "sla", "sra", "swap", "srl")
@@ -129,11 +143,19 @@ class State:
     memory: KnownMemory = EMPTY_MEMORY
     key1: Optional[int] = None
     lcdc: Optional[int] = None
+    joyp: Optional[int] = None
+    ly: Optional[int] = None
     hdma_source: tuple = (None, None)
+    hdma_destination: tuple = (None, None)
+    hdma_async: bool = False
     sram_enabled: Optional[bool] = None
     sram_bank: Optional[int] = None
     sram_erased: bool = False
     svbk: Optional[int] = None
+    vbk: Optional[int] = None
+    vram: KnownMemory = EMPTY_MEMORY
+    preview_remaining: int = 0
+    preview_interrupt: bool = False
 
 
 def word_bytes(word):
@@ -142,6 +164,10 @@ def word_bytes(word):
 
 def join_word(low, high):
     return None if low is None or high is None else low | (high << 8)
+
+
+def address_key(state):
+    return (state.bank if BANK_SIZE <= state.pc < 0x8000 else 0, state.pc)
 
 
 def ram_address(address):
@@ -253,8 +279,34 @@ def remember_byte(memory, address, value):
     return KnownMemory((*memory[:before], *merged, *memory[after:]))
 
 
+def replace_range(memory, start, end, values=()):
+    """Replace known bytes in one interval. Missing values leave it unknown."""
+    first = max(bisect_right(memory, (start + 1,)) - 1, 0)
+    last = bisect_left(memory, (end,))
+    ranges = list(memory[:first])
+    if first < len(memory) and memory[first][0] < start:
+        low, high, value = memory[first]
+        ranges.append((low, min(start, high), value))
+    offset = start
+    for value, run in groupby(values):
+        limit = offset + sum(1 for _ in run)
+        if value is not None:
+            ranges.append((offset, limit, value))
+        offset = limit
+    if last and memory[last - 1][1] > end:
+        ranges.append((end, *memory[last - 1][1:]))
+    ranges.extend(memory[last:])
+    merged = []
+    for low, high, value in ranges:
+        if merged and merged[-1][1:] == (low, value):
+            merged[-1] = (merged[-1][0], high, value)
+        else:
+            merged.append((low, high, value))
+    return KnownMemory(merged)
+
+
 class Cartridge:
-    def __init__(self, data):
+    def __init__(self, data, ram_code=()):
         self.data = data
         if len(data) < 2 * BANK_SIZE or len(data) % BANK_SIZE:
             raise ValueError("expected a cartridge image with complete 16 KiB banks")
@@ -269,12 +321,38 @@ class Cartridge:
         self.bank_mask = banks - 1
         self.cgb = bool(data[0x143] & 0x80)
         ram_sizes = (0, 0x800, 0x2000, 0x8000, 0x20000, 0x10000)
-        ram_code = data[0x149]
-        self.sram_size = ram_sizes[ram_code] if self.mbc5 and ram_code < len(ram_sizes) else 0
+        sram_code = data[0x149]
+        self.sram_size = ram_sizes[sram_code] if self.mbc5 and sram_code < len(ram_sizes) else 0
+        self.ram_code = self.register_ram_code(ram_code)
+
+    def register_ram_code(self, sections):
+        regions = {}
+        for start, bank, source, length in sections:
+            end = start + length
+            if not HRAM_BASE <= start < end <= HRAM_END:
+                raise ValueError("RAM code destination must fit in HRAM")
+            if (not 0 <= bank <= self.bank_mask or not 0 <= source < 0x8000
+                    or (source < BANK_SIZE and bank)
+                    or source + length > (source // BANK_SIZE + 1) * BANK_SIZE):
+                raise ValueError("RAM code source must fit in one cartridge ROM window")
+            offset = bank * BANK_SIZE + source % BANK_SIZE
+            payload = self.data[offset:offset + length]
+            for pc in range(start, end):
+                if pc in regions:
+                    raise ValueError(f"RAM code sections overlap at ${pc:04X}")
+                regions[pc] = payload, pc - start
+        return regions
+
+    def instruction_bytes(self, bank, pc):
+        if pc in self.ram_code:
+            data, offset = self.ram_code[pc]
+            return data, offset, len(data)
+        offset = bank * BANK_SIZE + pc % BANK_SIZE
+        return self.data, offset, (bank + 1) * BANK_SIZE
 
     def decode(self, bank, pc):
-        offset = bank * BANK_SIZE + (pc % BANK_SIZE)
-        opcode = self.data[offset]
+        data, offset, limit = self.instruction_bytes(bank, pc)
+        opcode = data[offset]
         if opcode in IMPLIED:
             return Instruction(opcode, 1, IMPLIED[opcode])
         if 0x40 <= opcode < 0x80:
@@ -287,9 +365,10 @@ class Cartridge:
         if 0x80 <= opcode < 0xc0:
             return Instruction(opcode, 1, f"{ALU_NAMES[(opcode >> 3) & 7]} {REGISTERS[opcode & 7]}")
         size = 3 if opcode in WORD_OPERAND else 2
-        if pc + size > (pc // BANK_SIZE + 1) * BANK_SIZE:
-            raise ValueError("instruction crosses a ROM window boundary")
-        operand = int.from_bytes(self.data[offset + 1:offset + size], "little")
+        if offset + size > limit:
+            window = "RAM code section" if pc in self.ram_code else "ROM window"
+            raise ValueError(f"instruction crosses a {window} boundary")
+        operand = int.from_bytes(data[offset + 1:offset + size], "little")
         if opcode in ALU_IMMEDIATE:
             return Instruction(opcode, 2, f"{ALU_NAMES[(opcode >> 3) & 7]} ${operand:02x}", operand)
         if opcode in BYTE_OPERAND or opcode in WORD_OPERAND:
@@ -398,12 +477,26 @@ class Cartridge:
             bank = 0 if address < BANK_SIZE else state.bank
             rom_bytes.add((bank, address))
             return self.data[bank * BANK_SIZE + address % BANK_SIZE]
+        if address == 0xff00:
+            return None if state.joyp is None else state.joyp | 0xcf
+        if VRAM_BASE <= address < VRAM_BASE + VRAM_SIZE:
+            if state.hdma_async:
+                return None
+            offset = VRAM_BANKS_BASE + address - VRAM_BASE
+            if state.vbk is not None:
+                return known_byte(state.vram, offset + state.vbk * VRAM_SIZE)
+            first = known_byte(state.vram, offset)
+            return first if first == known_byte(state.vram, offset + VRAM_SIZE) else None
         if address == 0xff4d:
             if not self.cgb:
                 return 0xff
             return None if state.key1 is None else state.key1 | 0x7e
         if address == 0xff40:
             return state.lcdc
+        if address == 0xff44:
+            return state.ly
+        if address == 0xff4f:
+            return 0xff if not self.cgb else None if state.vbk is None else state.vbk | 0xfe
         if address == 0xff70:
             return 0xff if not self.cgb else None if state.svbk is None else state.svbk | 0xf8
         if 0xa000 <= address < 0xc000:
@@ -422,12 +515,23 @@ class Cartridge:
             address = self.wram_bank_address(state.svbk, address)
         return known_byte(state.memory, address)
 
+    def read_byte(self, state, address, rom_bytes):
+        """Read a byte and account for LY polling in the untimed model."""
+        value = self.load_byte(state, address, rom_bytes)
+        if address is None:
+            return value, None
+        if address != 0xff44:
+            return value, state.ly
+        if state.lcdc is None or state.ly is None:
+            return value, None
+        return value, (state.ly + 1) % 154 if state.lcdc & 0x80 else state.ly
+
     def sram_address(self, bank, address):
         return SRAM_BASE + (((bank << 13) | (address & 0x1fff)) & (self.sram_size - 1))
 
     @staticmethod
     def retain_dma_source(bank, source, command, rom_bytes):
-        if None in source or command is None or command & 0x80:
+        if None in source or command is None:
             return (None, None)
         start = (source[0] & 0xf0) | (source[1] << 8)
         length = ((command & 0x7f) + 1) * 16
@@ -436,7 +540,33 @@ class Cartridge:
             rom_bytes.update((0 if address < BANK_SIZE else bank, address) for address in range(start, end))
         elif not (0xa000 <= start < end <= 0xe000):
             return (None, None)
-        return word_bytes(end)
+        return (None, None) if command & 0x80 else word_bytes(end)
+
+    def apply_vram_dma(self, state, command, rom_bytes, timing):
+        source_after = self.retain_dma_source(state.bank, state.hdma_source, command, rom_bytes)
+        if state.hdma_async or command is None or command & 0x80:
+            async_transfer = timing and (command is None or bool(command & 0x80))
+            return EMPTY_MEMORY, (None, None), (None, None), async_transfer
+
+        vram = state.vram
+        banks = (0, 1) if state.vbk is None else (state.vbk,)
+        length = (command + 1) * 16
+        dest_low, dest_high = state.hdma_destination
+        destination = None if None in state.hdma_destination else (dest_low & 0xf0) | ((dest_high & 0x1f) << 8)
+        if destination is None or destination + length > VRAM_SIZE:
+            for bank in banks:
+                start = VRAM_BANKS_BASE + bank * VRAM_SIZE
+                vram = replace_range(vram, start, start + VRAM_SIZE)
+            return vram, source_after, (None, None), False
+
+        values = ()
+        if state.vbk is not None and None not in source_after:
+            source = join_word(*source_after) - length
+            values = (self.load_byte(state, source + offset, rom_bytes) for offset in range(length))
+        for bank in banks:
+            start = VRAM_BANKS_BASE + bank * VRAM_SIZE + destination
+            vram = replace_range(vram, start, start + length, values)
+        return vram, source_after, word_bytes((destination + length) % VRAM_SIZE), False
 
     def successors(self, state, instruction, rom_bytes, *, timing=False):
         opcode, value = instruction.opcode, instruction.operand
@@ -445,16 +575,31 @@ class Cartridge:
         a, hl, stack, sp = state.a, state.hl, state.stack, state.sp
         b, c, z, carry = state.b, state.c, state.z, state.carry
         de, memory, key1, lcdc = state.de, state.memory, state.key1, state.lcdc
+        joyp, ly = state.joyp, state.ly
         hdma_source, svbk = state.hdma_source, state.svbk
+        hdma_destination, hdma_async = state.hdma_destination, state.hdma_async
+        vram, vbk = state.vram, state.vbk
         sram_enabled, sram_bank, sram_erased = state.sram_enabled, state.sram_bank, state.sram_erased
         hl_address = join_word(*hl)
         de_address = join_word(*de)
 
         if opcode == 0x76:
-            if timing:
+            if state.preview_remaining and not state.preview_interrupt:
+                word = word_bytes(next_pc)
+                yield replace(next_state, pc=0x40, preview_interrupt=True, ly=144,
+                              stack=(*stack, *reversed(word)),
+                              sp=None if sp is None else (sp - 2) & 0xffff,
+                              memory=self.push_memory(memory, sp, word, svbk))
+            elif timing:
                 yield next_state
             return
         if opcode in RETURNS:
+            preview_return = opcode == 0xd9 and state.preview_interrupt
+            if preview_return:
+                if state.preview_remaining == 1:
+                    return
+                next_state = replace(next_state, preview_remaining=state.preview_remaining - 1,
+                                     preview_interrupt=False)
             unconditional = opcode in (0xc9, 0xd9)
             taken = True if unconditional else condition_value(state, opcode)
             target = join_word(self.stack_byte(state, 0), self.stack_byte(state, 1))
@@ -480,22 +625,27 @@ class Cartridge:
             return
 
         if opcode in IMMEDIATE_LOADS:
+            if state.pc in self.ram_code:
+                value = self.load_byte(state, state.pc + 1, rom_bytes)
             yield load_register(next_state, IMMEDIATE_LOADS[opcode], value)
             return
         if 0x40 <= opcode < 0x80 and opcode not in HL_STORES:
             source = REGISTERS[opcode & 7]
-            loaded = (self.load_byte(state, hl_address, rom_bytes) if source == "[hl]"
-                      else register_byte(state, source))
+            if source == "[hl]":
+                loaded, ly = self.read_byte(state, hl_address, rom_bytes)
+                next_state = replace(next_state, ly=ly)
+            else:
+                loaded = register_byte(state, source)
             yield load_register(next_state, REGISTERS[(opcode >> 3) & 7], loaded)
             return
         if 0x80 <= opcode < 0xc0 or opcode in ALU_IMMEDIATE:
             source = REGISTERS[opcode & 7] if 0x80 <= opcode < 0xc0 else None
             if source == "[hl]":
-                operand = self.load_byte(state, hl_address, rom_bytes)
+                operand, ly = self.read_byte(state, hl_address, rom_bytes)
             else:
                 operand = value if source is None else register_byte(state, source)
             a, z, carry = abstract_alu((opcode >> 3) & 7, a, operand, carry, source == "a")
-            yield replace(next_state, a=a, z=z, carry=carry)
+            yield replace(next_state, a=a, z=z, carry=carry, ly=ly)
             return
         byte_step = opcode < 0x40 and opcode & 7 in (4, 5)
         step_register = REGISTERS[(opcode >> 3) & 7] if byte_step else None
@@ -519,13 +669,15 @@ class Cartridge:
         cb_result = None
         if opcode == 0xcb:
             register = REGISTERS[value & 7]
-            original = (self.load_byte(state, hl_address, rom_bytes) if register == "[hl]"
-                        else register_byte(state, register))
+            if register == "[hl]":
+                original, ly = self.read_byte(state, hl_address, rom_bytes)
+            else:
+                original = register_byte(state, register)
             bit = (value >> 3) & 7
             mask = 1 << bit
             group = value >> 6
             if group == 1:
-                yield replace(next_state, z=None if original is None else not bool(original & mask))
+                yield replace(next_state, z=None if original is None else not bool(original & mask), ly=ly)
                 return
             if group == 0:
                 cb_result, carry = abstract_shift(bit, original, carry)
@@ -538,15 +690,15 @@ class Cartridge:
             cb_store = True
 
         if opcode == 0xf0:
-            a = self.load_byte(state, 0xff00 | value, rom_bytes)
+            a, ly = self.read_byte(state, 0xff00 | value, rom_bytes)
         elif opcode == 0xf2:
-            a = self.load_byte(state, None if c is None else 0xff00 | c, rom_bytes)
+            a, ly = self.read_byte(state, None if c is None else 0xff00 | c, rom_bytes)
         elif opcode in (0x0a, 0x1a):
-            a = self.load_byte(state, join_word(c, b) if opcode == 0x0a else de_address, rom_bytes)
+            a, ly = self.read_byte(state, join_word(c, b) if opcode == 0x0a else de_address, rom_bytes)
         elif opcode == 0xfa:
-            a = self.load_byte(state, value, rom_bytes)
+            a, ly = self.read_byte(state, value, rom_bytes)
         elif opcode in (0x2a, 0x3a):
-            a = self.load_byte(state, hl_address, rom_bytes)
+            a, ly = self.read_byte(state, hl_address, rom_bytes)
             step = 1 if opcode == 0x2a else -1
             hl = word_bytes(None if hl_address is None else (hl_address + step) & 0xffff)
         elif opcode in (0x07, 0x0f, 0x17, 0x1f):
@@ -592,7 +744,7 @@ class Cartridge:
             if opcode == 0x36:
                 stored = value
             if byte_step:
-                original = self.load_byte(state, address, rom_bytes)
+                original, ly = self.read_byte(state, address, rom_bytes)
                 stored = None if original is None else (original + (-1 if opcode & 1 else 1)) & 0xff
                 z = None if stored is None else stored == 0
             if cb_store:
@@ -607,6 +759,13 @@ class Cartridge:
                 sram_enabled, sram_bank, sram_erased = None, None, False
             else:
                 memory = self.remember_ram(memory, address, stored, svbk)
+                if VRAM_BASE <= address < VRAM_BASE + VRAM_SIZE and not hdma_async:
+                    offset = VRAM_BANKS_BASE + address - VRAM_BASE
+                    if vbk is None:
+                        vram = remember_byte(vram, offset, None)
+                        vram = remember_byte(vram, offset + VRAM_SIZE, None)
+                    else:
+                        vram = remember_byte(vram, offset + vbk * VRAM_SIZE, stored)
                 if self.sram_size:
                     if address < 0x2000:
                         sram_enabled = None if stored is None else (stored & 0x0f) == 0x0a
@@ -626,6 +785,14 @@ class Cartridge:
                 stack = (None,) * len(stack)
             if address is None or address == 0xff40:
                 lcdc = stored if address is not None else None
+                if lcdc is None:
+                    ly = None
+                elif not timing and not lcdc & 0x80:
+                    ly = 0
+            if address is None or address == 0xff00:
+                joyp = None if address is None or stored is None else stored & 0x30
+            if address is None and (self.cgb or not high_only):
+                vram = EMPTY_MEMORY
             if address == 0xff46 and stored is not None and stored < 0x80:
                 start = stored << 8
                 bank = 0 if start < BANK_SIZE else state.bank
@@ -637,14 +804,25 @@ class Cartridge:
                 if address is None:
                     key1 = None
                     hdma_source = (None, None)
+                    hdma_destination = (None, None)
+                    hdma_async = timing
+                    vbk = None
                 elif address == 0xff4d and key1 is not None:
                     key1 = None if stored is None else (key1 & 0x80) | (stored & 1)
+                elif address == 0xff4f:
+                    vbk = None if stored is None else stored & 1
                 elif address == 0xff51:
                     hdma_source = (hdma_source[0], stored)
                 elif address == 0xff52:
                     hdma_source = (stored, hdma_source[1])
+                elif address == 0xff53:
+                    hdma_destination = (hdma_destination[0], stored)
+                elif address == 0xff54:
+                    hdma_destination = (stored, hdma_destination[1])
                 elif address == 0xff55:
-                    hdma_source = self.retain_dma_source(state.bank, hdma_source, stored, rom_bytes)
+                    vram, hdma_source, hdma_destination, hdma_async = self.apply_vram_dma(
+                        state, stored, rom_bytes, timing
+                    )
             if opcode in (0x22, 0x32):
                 step = 1 if opcode == 0x22 else -1
                 hl = word_bytes(None if hl_address is None else (hl_address + step) & 0xffff)
@@ -707,25 +885,43 @@ class Cartridge:
         for bank in sorted(banks):
             yield replace(next_state, bank=bank, a=a, hl=hl, stack=stack, sp=sp,
                           b=b, c=c, z=z, carry=carry, de=de, memory=memory, key1=key1, lcdc=lcdc,
+                          joyp=joyp, ly=ly,
                           hdma_source=hdma_source, sram_enabled=sram_enabled, sram_bank=sram_bank,
-                          sram_erased=sram_erased, svbk=svbk)
+                          sram_erased=sram_erased, svbk=svbk, vbk=vbk, vram=vram,
+                          hdma_destination=hdma_destination, hdma_async=hdma_async)
 
-    def discover(self, extra_entries=(), stop_at=None, rom_bytes=None, *, timing=False, trap_unsupported=False):
+    def discover(self, extra_entries=(), stop_at=None, rom_bytes=None, *, timing=False,
+                 trap_unsupported=False, vblank_preview=False, dispatch_targets=None):
+        if not isinstance(vblank_preview, int) or not 0 <= vblank_preview <= 0xffffff:
+            raise ValueError("VBlank preview frame count must fit in an unsigned 24-bit integer")
+        if timing and vblank_preview:
+            raise ValueError("VBlank preview and timed execution are mutually exclusive")
         entry_a = 0x11 if self.cgb else 0x01
         work = deque([State(ENTRY, 1, entry_a, sp=0xfffe, key1=0 if self.cgb else None, lcdc=0x91,
-                            sram_enabled=False, sram_bank=0, sram_erased=True, svbk=0)])
+                            sram_enabled=False, sram_bank=0, sram_erased=True, svbk=0,
+                            vbk=0, hdma_source=(0, 0), hdma_destination=(0, 0),
+                            joyp=0, ly=None if timing else 0,
+                            preview_remaining=int(vblank_preview))])
         if rom_bytes is None:
             rom_bytes = set()
         if stop_at is not None:
             bank, pc = stop_at
-            if not 0 <= bank <= self.bank_mask or not 0 <= pc < 0x8000 or (pc < BANK_SIZE and bank):
-                raise ValueError("checkpoint is outside cartridge ROM")
+            if pc in self.ram_code:
+                if bank:
+                    raise ValueError("RAM code checkpoints use bank 0")
+            elif not 0 <= bank <= self.bank_mask or not 0 <= pc < 0x8000 or (pc < BANK_SIZE and bank):
+                raise ValueError("checkpoint is outside cartridge ROM or registered RAM code")
         for bank, pc, *stack_pointer in extra_entries:
-            if not 0 <= bank <= self.bank_mask or not 0 <= pc < 0x8000:
-                raise ValueError("extra entry is outside cartridge ROM")
+            if not 0 <= bank <= self.bank_mask or (not 0 <= pc < 0x8000 and pc not in self.ram_code):
+                raise ValueError("extra entry is outside cartridge ROM or registered RAM code")
             if len(stack_pointer) > 1 or stack_pointer and not 0 <= stack_pointer[0] <= 0xffff:
                 raise ValueError("extra entry stack pointer is outside the guest address space")
-            work.append(State(pc, bank, sp=stack_pointer[0] if stack_pointer else None))
+            entry = State(pc, bank, sp=stack_pointer[0] if stack_pointer else None,
+                          vbk=None if self.cgb else 0, hdma_async=timing and self.cgb,
+                          preview_remaining=int(vblank_preview))
+            if dispatch_targets is not None:
+                dispatch_targets.add(address_key(entry))
+            work.append(entry)
         seen = set()
         instructions = {}
         occupied = {}
@@ -734,13 +930,13 @@ class Cartridge:
             if state in seen:
                 continue
             seen.add(state)
-            bank = state.bank if state.pc >= BANK_SIZE else 0
+            bank, _ = address_key(state)
             location = f"${bank:03X}:${state.pc:04X}"
             try:
                 if len(seen) > 750_000 or len(state.stack) > 512:
                     raise ValueError("static analysis exceeded its state or call-depth limit")
-                if not 0 <= state.pc < 0x8000:
-                    raise ValueError("control transfer outside cartridge ROM")
+                if not 0 <= state.pc < 0x8000 and state.pc not in self.ram_code:
+                    raise ValueError("control transfer outside cartridge ROM or registered RAM code")
                 key = bank, state.pc
                 if key == stop_at:
                     if occupied.setdefault(key, state.pc) != state.pc:
@@ -760,9 +956,28 @@ class Cartridge:
                         if owner != state.pc:
                             raise ValueError(f"instruction overlaps code at ${owner:04X}")
                     instructions[key] = instruction
-                if instructions[key].opcode == UNSUPPORTED:
+                instruction = instructions[key]
+                opcode = instruction.opcode
+                if opcode == UNSUPPORTED:
                     continue
-                work.extend(self.successors(state, instructions[key], rom_bytes, timing=timing))
+                successors = self.successors(state, instruction, rom_bytes, timing=timing)
+                if dispatch_targets is None:
+                    work.extend(successors)
+                    continue
+
+                if opcode == 0xe9 and join_word(*state.hl) is None:
+                    dispatch_targets.add(None)
+                if opcode in RETURNS:
+                    preview_ends = opcode == 0xd9 and state.preview_interrupt and state.preview_remaining == 1
+                    can_return = opcode not in CONDITIONAL_RET or condition_value(state, opcode) is not False
+                    if not preview_ends and can_return and join_word(
+                            self.stack_byte(state, 0), self.stack_byte(state, 1)) is None:
+                        dispatch_targets.add(None)
+                transfer = opcode in CONTROL_TRANSFERS or opcode & 0xc7 == 0xc7
+                for successor in successors:
+                    if transfer or successor.bank != state.bank:
+                        dispatch_targets.add(address_key(successor))
+                    work.append(successor)
             except ValueError as error:
                 raise ValueError(f"{location}: {error}") from error
         if stop_at is not None and stop_at not in instructions:
@@ -774,24 +989,81 @@ def symbol(bank, pc):
     return f"gb_{bank:03x}_{pc:04x}"
 
 
-def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False, trap_unsupported=False):
+def direct_branch(bank, pc, instruction, instructions):
+    opcode = instruction.opcode
+    if opcode not in (0x18, 0xc3, *CONDITIONAL_JR, *CONDITIONAL_JP):
+        return None
+
+    def destination(address):
+        if BANK_SIZE <= address < 2 * BANK_SIZE:
+            if not BANK_SIZE <= pc < 2 * BANK_SIZE:
+                return None
+            key = bank, address
+        else:
+            key = 0, address
+        return key if key in instructions else None
+
+    taken = destination(instruction.operand)
+    if taken is None:
+        return None
+    if opcode in (0x18, 0xc3):
+        return [f"jp _{symbol(*taken)}"]
+
+    next_pc = pc + instruction.size
+    fallthrough = destination(next_pc)
+    if fallthrough is None:
+        return None
+    flag = 4 if opcode & 0x10 else 7
+    condition = "nz" if opcode & 8 else "z"
+    native = ["ld a, (_gb_f)", f"bit {flag}, a", f"jp {condition}, _{symbol(*taken)}"]
+    if fallthrough != (bank, next_pc) or pc // BANK_SIZE != next_pc // BANK_SIZE:
+        native.append(f"jp _{symbol(*fallthrough)}")
+    return native
+
+
+def checked_helper_stubs(helpers):
+    assembly = []
+    for helper, argument in sorted(helpers):
+        assembly.extend(["", f"_gb_at_pc_{helper}:"])
+        if argument:
+            assembly.extend(["    ld (_gb_pc), de", "    push hl"])
+        else:
+            assembly.append("    ld (_gb_pc), hl")
+        assembly.append(f"    call _gb_{helper}")
+        if argument:
+            assembly.append("    pop de")
+        assembly.append("    jp .Lchecked_return")
+    if helpers:
+        # A fault returns from the guest, so discard the helper's native return address.
+        assembly.extend(["", ".Lchecked_return:", "    or a, a", "    ret nz",
+                         "    pop de", "    jp _gb_unmapped"])
+    return assembly
+
+
+def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
+                trap_unsupported=False, ram_code=(), vblank_preview=False):
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
                               0xc000 <= watch_address < 0xe000 or
                               0xff80 <= watch_address <= 0xfffe):
         raise ValueError("watch address must be in VRAM, WRAM or HRAM")
-    cartridge = Cartridge(data)
+    cartridge = Cartridge(data, ram_code)
     rom_bytes = set()
+    dispatch_targets = set() if vblank_preview else None
     instructions = cartridge.discover(extra_entries, stop_at, rom_bytes, timing=timing,
-                                      trap_unsupported=trap_unsupported)
+                                      trap_unsupported=trap_unsupported, vblank_preview=vblank_preview,
+                                      dispatch_targets=dispatch_targets)
     assembly = ["    .assume ADL=1", "    .section .text"]
     targets = ['#include "runtime.h"', ""]
-    entries = []
-    for (bank, pc), instruction in sorted(instructions.items()):
+    fallback_addresses = set()
+    helpers = set()
+    ordered = sorted(instructions.items())
+    for (bank, pc), instruction in ordered:
         name = symbol(bank, pc)
         targets.append(f"extern void {name}(void);")
-        entries.append(f"    {{0x{bank:03x}, 0x{pc:04x}, {name}}},")
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
         opcode = instruction.opcode
+        in_ram = pc in cartridge.ram_code
+        checked = CHECKED_HELPERS.get(opcode) if not timing and not in_ram else None
         cb_memory = opcode == 0xcb and instruction.operand & 7 == 6
         remaps = opcode in (*MEMORY_STORES, 0x34, 0x35) or (
             cb_memory and instruction.operand >> 6 != 1
@@ -799,9 +1071,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         if timing and opcode not in (CHECKPOINT, UNSUPPORTED):
             assembly.extend([f"    ld hl, 0x{pc:04x}", f"    ld de, {instruction.tcycles()}",
                              "    call _gb_boundary"])
-        elif remaps or cb_memory or opcode & 0xc7 == 0xc7 or opcode in (
+        elif checked is None and (in_ram or remaps or cb_memory or opcode & 0xc7 == 0xc7 or opcode in (
                 CHECKPOINT, UNSUPPORTED, 0x10, 0x76, 0xcd, 0xe0, 0xe2, *MEMORY_LOADS, *PUSHES, *POPS,
-                *RETURNS, *CONDITIONAL_CALL) or 0x80 <= opcode < 0xc0 and opcode & 7 == 6:
+                *RETURNS, *CONDITIONAL_CALL) or 0x80 <= opcode < 0xc0 and opcode & 7 == 6):
             assembly.extend([f"    ld hl, 0x{pc:04x}", "    ld (_gb_pc), hl"])
         if opcode == CHECKPOINT:
             assembly.append("    jp _gb_checkpoint")
@@ -809,14 +1081,48 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         if opcode == UNSUPPORTED:
             assembly.append("    jp _gb_unmapped")
             continue
-        native, size = lower_instruction(instruction.text, pc, timing=timing)
+        live_immediate = in_ram and opcode in IMMEDIATE_LOADS
+        if in_ram:
+            image, offset, _ = cartridge.instruction_bytes(bank, pc)
+            guard_size = 1 if live_immediate else instruction.size
+            for index, byte in enumerate(image[offset:offset + guard_size]):
+                assembly.extend([f"    ld a, (_gb_hram+{pc - HRAM_BASE + index})",
+                                 f"    cp a, 0x{byte:02x}", "    jp nz, _gb_unmapped"])
+        native = None if timing else direct_branch(bank, pc, instruction, instructions)
+        if native is not None:
+            assembly.extend(f"    {line}" for line in native)
+            continue
+        if checked:
+            helper, argument = checked
+            helpers.add(checked)
+            native = [f"ld hl, 0x{instruction.operand:04x}", f"ld de, 0x{pc:04x}"] if argument else [
+                f"ld hl, 0x{pc:04x}"
+            ]
+            native.append(f"call _gb_at_pc_{helper}")
+            size = instruction.size
+        else:
+            native, size = lower_instruction(instruction.text, pc, timing=timing,
+                                             live_immediate=live_immediate, vblank_preview=vblank_preview)
         assembly.extend(f"    {line}" for line in native)
         if size is not None:
             next_pc = pc + size
             # Adjacent blocks fall through. A bank change needs a lookup.
             if ((bank, next_pc) not in instructions or pc // BANK_SIZE != next_pc // BANK_SIZE
-                    or (pc >= BANK_SIZE and remaps)):
+                    or (BANK_SIZE <= pc < 0x8000 and remaps)):
+                fallback_addresses.add(next_pc)
                 assembly.extend(f"    {line}" for line in dispatch(next_pc))
+    assembly.extend(checked_helper_stubs(helpers))
+    entries = []
+    target_banks = []
+    for (bank, pc), instruction in ordered:
+        if (dispatch_targets is not None and None not in dispatch_targets
+                and (bank, pc) not in dispatch_targets and pc not in fallback_addresses
+                and (bank, pc) != (0, ENTRY) and instruction.opcode != CHECKPOINT):
+            continue
+        if not target_banks or target_banks[-1][0] != bank:
+            target_banks.append([bank, len(entries), 0])
+        target_banks[-1][2] += 1
+        entries.append(f"    {{0x{pc:04x}, {symbol(bank, pc)}}},")
     spans = []
     payload = bytearray()
     for bank, address in sorted(rom_bytes):
@@ -835,12 +1141,16 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     ]
     targets.extend([
         "", "const GbTarget gb_targets[] = {", *entries, "};",
-        "const unsigned gb_target_count = sizeof(gb_targets) / sizeof(gb_targets[0]);",
+        "const GbTargetBank gb_target_banks[] = {",
+        *(f"    {{0x{bank:03x}, {first}, {count}}}," for bank, first, count in target_banks),
+        "};",
+        f"const unsigned gb_target_bank_count = {len(target_banks)};",
         f"const uint16_t rom_bank_mask = {cartridge.bank_mask};",
         f"const uint16_t rom_watch_address = 0x{watch_address:04x};",
         f"const uint8_t rom_mbc5 = {int(cartridge.mbc5)};",
         f"const uint8_t rom_cgb = {int(cartridge.cgb)};",
         f"const uint8_t rom_timing = {int(timing)};",
+        f"const unsigned rom_preview_frames = {int(vblank_preview)};",
         f"const uint8_t rom_ram_size_code = {data[0x149]};",
         "", "const GbRomSpan gb_rom_spans[] = {", *(data_entries or ["    {0, 0, 0, 0},"]), "};",
         f"const unsigned gb_rom_span_count = {len(data_entries)};",

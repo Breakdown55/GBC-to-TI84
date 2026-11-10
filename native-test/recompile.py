@@ -75,6 +75,12 @@ def build(ce, work, name, show_frame=False):
         "-T", ce / "meta/linker_script.ld", "-Map=program.map", "program.o", "crt0.o",
         "--start-group", lib / "libc/allocator_standard.a", *core_libs,
         "--end-group", "-o", "program.obj")
+    mapping = (work / "program.map").read_text()
+    load_end = re.search(r"(?m)^\s*(0x[0-9a-fA-F]+)\s+___data_high\s*=", mapping)
+    if load_end is None:
+        raise ValueError("could not determine the linked program's end address")
+    if int(load_end[1], 16) > 0xd40000:
+        raise ValueError("the linked program would overlap calculator display RAM")
     convert_args = ("-u", "-n", name, "-j", "elf", "-i", "program.obj", "-o", "program.8xp")
     run("bin/convbin", "-k", "8xp", *convert_args)
     parts = list(work.glob("program.8xp.*.8xv"))
@@ -99,6 +105,12 @@ def parse_seed(text):
     return tuple(int(part, 16) for part in text.split(":"))
 
 
+def parse_ram_code(text):
+    if not re.fullmatch(r"[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,3}:[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}", text):
+        raise argparse.ArgumentTypeError("expected hexadecimal START:BANK:SOURCE:LENGTH")
+    return tuple(int(part, 16) for part in text.split(":"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rom", type=Path)
@@ -109,8 +121,13 @@ def main():
                         help="additional hexadecimal BANK:ADDRESS[:SP] entry for dynamic targets")
     parser.add_argument("--stop-at", type=parse_entry,
                         help="stop before executing this hexadecimal BANK:ADDRESS")
-    parser.add_argument("--timing", action="store_true", help="enable guest timing and interrupts")
+    clock = parser.add_mutually_exclusive_group()
+    clock.add_argument("--timing", action="store_true", help="enable guest timing and interrupts")
+    clock.add_argument("--vblank-preview", nargs="?", type=int, const=1, default=None, metavar="FRAMES",
+                       help="serve this many VBlank interrupts at HALT and show the result (default: 1)")
     parser.add_argument("--frame", action="store_true", help="show the guest display on a normal stop")
+    parser.add_argument("--ram-code", type=parse_ram_code, action="append", default=[],
+                        help="translate code copied into HRAM from ROM, as START:BANK:SOURCE:LENGTH")
     parser.add_argument("--trap-unsupported", action="store_true",
                         help="build with runtime faults for unsupported opcodes")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
@@ -123,16 +140,20 @@ def main():
         parser.error("the .8xp and .map outputs must be separate from the input")
     if args.watch == 0:
         parser.error("--watch must be a VRAM, WRAM, or HRAM address")
+    if args.vblank_preview is not None and not 1 <= args.vblank_preview <= 0xffffff:
+        parser.error("--vblank-preview expects a positive 24-bit frame count")
+    preview_frames = args.vblank_preview or 0
     try:
         assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at,
-                                      timing=args.timing, trap_unsupported=args.trap_unsupported)
+                                      timing=args.timing, trap_unsupported=args.trap_unsupported,
+                                      ram_code=args.ram_code, vblank_preview=preview_frames)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:
             work = Path(directory)
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
-            build(ce, work, args.name, args.frame)
+            build(ce, work, args.name, args.frame or bool(preview_frames))
             os.replace(work / "program.8xp", output)
             os.replace(work / "program.map", output.with_suffix(".map"))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

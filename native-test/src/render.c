@@ -97,16 +97,23 @@ static uint8_t tile_pixel(const uint8_t *row, unsigned x, uint8_t attributes)
 
 static void render_background(uint8_t y, uint16_t *pixels, uint8_t *background)
 {
+    if (!gb_cgb && !(gb_lcdc & BG_ENABLE_PRIORITY)) {
+        memset(background, 0, GB_SCREEN_WIDTH);
+        memset(pixels, 0xff, GB_SCREEN_WIDTH * sizeof(*pixels));
+        return;
+    }
+
     int window_x = (int)gb_wx - 7;
     bool window_enabled = (gb_lcdc & WINDOW_ENABLE) && y >= gb_wy;
-
-    for (int x = 0; x < GB_SCREEN_WIDTH; ++x) {
-        if (!gb_cgb && !(gb_lcdc & BG_ENABLE_PRIORITY)) {
-            background[x] = 0;
-            pixels[x] = 0xffff;
-            continue;
+    uint16_t colors[8][4];
+    unsigned palette_count = gb_cgb ? 8 : 1;
+    for (unsigned palette = 0; palette < palette_count; ++palette) {
+        for (unsigned color = 0; color < 4; ++color) {
+            colors[palette][color] = palette_color(BG_PALETTE, palette, color);
         }
+    }
 
+    for (int x = 0; x < GB_SCREEN_WIDTH;) {
         bool window = window_enabled && x >= window_x;
         /* The snapshot uses one set of registers for all scanlines. */
         uint8_t tile_x = window ? x - window_x : x + gb_scx;
@@ -121,9 +128,20 @@ static void render_background(uint8_t y, uint16_t *pixels, uint8_t *background)
             row = 7 - row;
         }
         unsigned address = (gb_lcdc & UNSIGNED_TILES) ? tile * 16 : 0x1000 + (int8_t)tile * 16;
-        uint8_t color = tile_pixel(&gb_vram[bank][address + row * 2], tile_x & 7, attributes);
-        background[x] = color | (attributes & PRIORITY);
-        pixels[x] = palette_color(BG_PALETTE, attributes, color);
+        const uint8_t *tile_row = &gb_vram[bank][address + row * 2];
+        unsigned column = tile_x & 7;
+        int end = x + (int)(8 - column);
+        if (window_enabled && !window && window_x < end) {
+            end = window_x;
+        }
+        if (end > GB_SCREEN_WIDTH) {
+            end = GB_SCREEN_WIDTH;
+        }
+        for (; x < end; ++x, ++column) {
+            uint8_t color = tile_pixel(tile_row, column, attributes);
+            background[x] = color | (attributes & PRIORITY);
+            pixels[x] = colors[attributes & 7][color];
+        }
     }
 }
 

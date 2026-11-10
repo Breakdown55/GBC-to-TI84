@@ -140,6 +140,48 @@ def restart_rom():
     return data
 
 
+def hram_rom():
+    data = cartridge_image()
+    data[0x100:0x103] = bytes.fromhex("c3 50 01")
+    routine = bytes.fromhex("3e 00 ea 23 c1 c9")
+    data[0x300:0x300 + len(routine)] = routine
+    code = bytes.fromhex(
+        "31 00 d0 21 00 03 0e 80 06 06"  # Copy the routine to HRAM.
+        " 2a e2 0c 05 20 fa"
+        " 3e a5 e0 81 cd 80 ff 76"  # Patch an immediate, call the copy, then HALT.
+    )
+    data[0x150:0x150 + len(code)] = code
+    return data
+
+
+def tilemap_rom():
+    data = cartridge_image()
+    data[0x100:0x103] = bytes.fromhex("c3 50 01")
+    data[0x40:0x43] = bytes.fromhex("c3 00 03")
+    data[0x600:0x610] = bytes.fromhex("f0 0f") * 8
+    code = bytes.fromhex(
+        "31 00 d0 f3 af e0 40 e0 0f 3e 01 e0 ff e0 4f"
+        " 3e 06 e0 51 af e0 52 e0 53 3e 10 e0 54 af e0 55"
+        " 3e 91 e0 40 fb 00 76"
+    )
+    data[0x150:0x150 + len(code)] = code
+
+    handler = bytearray.fromhex(
+        "3e 8a e0 68 3e ff e0 69 3e 03 e0 69 af e0 69 3e 7c e0 69"
+        " af e0 4f 3e 01"
+    )
+    cells = [0x9800 + y * 32 + x for y in range(3, 8) for x in range(3, 9)]
+    for address in cells:
+        handler.extend((0xea, address & 0xff, address >> 8))
+    handler.extend(bytes.fromhex("3e 01 e0 4f"))
+    for address in cells:
+        attributes = 0x09 | (0x20 if address & 1 else 0)
+        handler.extend((0x3e, attributes, 0xea, address & 0xff, address >> 8))
+    handler.append(0xd9)
+    data[0x300:0x300 + len(handler)] = handler
+    return data
+
+
 class RomTest(unittest.TestCase):
     def test_reachable_code_and_banks(self):
         data = synthetic_rom()
@@ -152,7 +194,7 @@ class RomTest(unittest.TestCase):
         self.assertNotIn((0, 0x104), instructions)  # Cartridge header.
         assembly, targets = compile_rom(data, watch_address=0xc123)
         self.assertIn("jp _gb_call", assembly)
-        self.assertIn("{0x002, 0x4000, gb_002_4000}", targets)
+        self.assertIn("{0x4000, gb_002_4000}", targets)
         self.assertIn("rom_watch_address = 0xc123", targets)
 
     def test_unknown_zero_flag_keeps_both_branches(self):
@@ -268,10 +310,40 @@ class RomTest(unittest.TestCase):
         self.assertIn((0, 0x15a), instructions)
         self.assertNotIn((0, 0x159), instructions)
 
+    def test_copied_hram_code_uses_live_immediate_and_guards_opcode(self):
+        data = hram_rom()
+        assembly, targets = compile_rom(data, ram_code=[(0xff80, 0, 0x300, 6)])
+        self.assertIn("gb_000_ff80", targets)
+        self.assertIn("ld a, (_gb_hram+1)", assembly)
+        self.assertIn("ld a, (_gb_hram+0)", assembly)
+
+    def test_vblank_preview_uses_live_state_and_stops_at_reti(self):
+        data, _ = frame_rom()
+        assembly, targets = compile_rom(data, vblank_preview=True)
+        self.assertIn("jp _gb_preview_vblank", assembly)
+        self.assertIn("jp _gb_preview_reti", assembly)
+        self.assertIn("gb_000_0040", targets)
+
+    def test_multi_frame_preview_reaches_the_next_halt(self):
+        data, (_, resume) = frame_rom()
+        data[resume] = 0x76
+        _, single = compile_rom(data, vblank_preview=1)
+        assembly, multiple = compile_rom(data, vblank_preview=2)
+        self.assertNotIn(f"gb_000_{resume:04x}", single)
+        self.assertIn(f"gb_000_{resume:04x}", multiple)
+        self.assertEqual(assembly.count("jp _gb_preview_vblank"), 2)
+        self.assertIn("rom_preview_frames = 2", multiple)
+
+    def test_tilemap_preview_retains_banked_tile_data(self):
+        assembly, targets = compile_rom(tilemap_rom(), vblank_preview=1)
+        self.assertIn("jp _gb_preview_reti", assembly)
+        self.assertIn("{0x000, 0x0600, 0x0010, 0x000000}", targets)
+
 
 if __name__ == "__main__":
     fixtures = {"--write": synthetic_rom, "--write-color": color_rom,
-                "--write-frame": lambda: frame_rom()[0], "--write-rst": restart_rom}
+                "--write-frame": lambda: frame_rom()[0], "--write-rst": restart_rom,
+                "--write-hram": hram_rom, "--write-tilemap": tilemap_rom}
     if len(sys.argv) == 3 and sys.argv[1] in fixtures:
         output = Path(sys.argv[2])
         output.parent.mkdir(parents=True, exist_ok=True)

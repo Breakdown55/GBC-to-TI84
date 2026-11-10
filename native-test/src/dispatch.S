@@ -72,3 +72,31 @@ _gb_timed_halt:
 .Lresume:
     ex de, hl
     jp _gb_dispatch
+
+    .section .text.gb_preview_dispatch
+    .global _gb_preview_vblank
+    .global _gb_preview_reti
+
+_gb_preview_vblank:
+    push hl
+    call _gb_preview_begin
+    pop de
+    or a, a
+    jp z, _gb_unmapped
+    ld hl, 0x0040
+    jp _gb_dispatch
+
+_gb_preview_reti:
+    call _gb_pop_word
+    ld de, 0x10000
+    or a, a
+    sbc hl, de
+    jp nc, _gb_unmapped
+    add hl, de
+    ld (_gb_pc), hl
+    call _gb_timing_enable_ime
+    call _gb_preview_finish
+    or a, a
+    jp nz, _gb_checkpoint
+    ld hl, (_gb_pc)
+    jp _gb_dispatch

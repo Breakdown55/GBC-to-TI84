@@ -8,9 +8,11 @@ extern uint8_t gb_timing_extra;
 extern uint24_t gb_frame_count;
 
 void gb_timing_init(void);
-void gb_timing_flush(void);
+uint8_t gb_timing_flush(void);
 uint8_t gb_timing_read(uint8_t offset);
 void gb_timing_write(uint8_t offset, uint8_t value);
+uint8_t gb_timing_claim_hblank(void);
+void gb_timing_stall(uint16_t dots);
 void gb_ei(void);
 void gb_di(void);
 

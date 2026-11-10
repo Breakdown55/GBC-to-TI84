@@ -12,10 +12,15 @@ enum {
 typedef void (*GbNativeBlock)(void);
 
 typedef struct {
-    uint16_t bank;
     uint16_t address;
     GbNativeBlock entry;
 } GbTarget;
+
+typedef struct {
+    uint16_t bank;
+    unsigned first;
+    unsigned count;
+} GbTargetBank;
 
 typedef struct {
     uint16_t bank;
@@ -24,8 +29,9 @@ typedef struct {
     uint24_t offset;
 } GbRomSpan;
 
-extern const GbTarget gb_targets[]; /* Sorted by bank, then guest address. */
-extern const unsigned gb_target_count;
+extern const GbTarget gb_targets[]; /* Sorted by guest address within each bank. */
+extern const GbTargetBank gb_target_banks[];
+extern const unsigned gb_target_bank_count;
 extern const GbRomSpan *gb_rom_data;
 extern const uint8_t *gb_rom_payload;
 extern unsigned gb_rom_data_count;

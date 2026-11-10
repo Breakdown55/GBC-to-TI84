@@ -71,12 +71,13 @@ def high_address(operand):
         return HIGH_REGISTERS[operand]
     if re.fullmatch(r"\$ff[0-9a-f]{2}", operand):
         address = int(operand[1:], 16)
-        if address >= 0xff80 or address in HIGH_REGISTERS.values():
+        if (address >= 0xff80 or 0xff10 <= address < 0xff27 or 0xff30 <= address < 0xff40
+                or address in HIGH_REGISTERS.values()):
             return address
     return None
 
 
-def lower_instruction(instruction, pc=None, *, timing=False):
+def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=False, vblank_preview=False):
     normalized = instruction.lower()
     parts = normalized.split()
     # A byte count advances the Game Boy PC. None ends the native block.
@@ -227,7 +228,8 @@ def lower_instruction(instruction, pc=None, *, timing=False):
         register, digits = load.groups()
         value = int(digits, 16)
         if register in BYTE_REGISTERS and len(digits) <= 2:
-            return [f"ld a, 0x{value:02x}", f"ld ({BYTE_REGISTERS[register]}), a"], 2
+            operand = f"(_gb_hram+{pc + 1 - 0xff80})" if live_immediate else f"0x{value:02x}"
+            return [f"ld a, {operand}", f"ld ({BYTE_REGISTERS[register]}), a"], 2
         if register in ("bc", "de", "hl"):
             return [f"ld hl, 0x{value:04x}", f"ld (_gb_{register}), hl"], 3
         if register == "sp":
@@ -314,6 +316,8 @@ def lower_instruction(instruction, pc=None, *, timing=False):
     if parts == ["ret"]:
         return ["jp _gb_ret"], None
     if parts == ["reti"]:
+        if vblank_preview:
+            return ["jp _gb_preview_reti"], None
         if timing:
             return ["jp _gb_reti"], None
         return ["ld a, 1", "ld (_gb_ime), a", "jp _gb_ret"], None
@@ -329,10 +333,11 @@ def lower_instruction(instruction, pc=None, *, timing=False):
             ], 1
         return ["ld a, (_gb_f)", f"bit {bit}, a", f"jp {condition}, _gb_ret"], 1
     if parts == ["halt"]:
-        if timing:
+        if timing or vblank_preview:
             if pc is None:
-                raise ValueError("timed HALT requires a Game Boy address")
-            return [f"ld hl, 0x{(pc + 1) & 0xffff:04x}", "jp _gb_timed_halt"], None
+                raise ValueError("interruptible HALT requires a Game Boy address")
+            target = "_gb_preview_vblank" if vblank_preview else "_gb_timed_halt"
+            return [f"ld hl, 0x{(pc + 1) & 0xffff:04x}", f"jp {target}"], None
         return ["jp _gb_halt"], None
     if parts == ["jp", "hl"]:
         return ["ld hl, (_gb_hl)", "jp _gb_dispatch"], None

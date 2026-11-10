@@ -64,6 +64,8 @@ uint8_t gb_tac;
 uint8_t gb_nr50;
 uint8_t gb_nr51;
 uint8_t gb_nr52;
+static uint8_t sound_channels[0x14];
+static uint8_t wave_ram[0x10];
 uint8_t gb_lyc;
 uint8_t gb_wy;
 uint8_t gb_wx;
@@ -223,8 +225,20 @@ static bool timed_register(uint8_t offset)
 
 static uint16_t read_high(uint8_t offset)
 {
+    static const uint8_t sound_read_mask[] = {
+        0x80, 0x3f, 0x00, 0xff, 0xbf,
+        0xff, 0x3f, 0x00, 0xff, 0xbf,
+        0x7f, 0xff, 0x9f, 0xff, 0xbf,
+        0xff, 0xff, 0x00, 0x00, 0xbf,
+    };
     if (gb_timing_enabled && timed_register(offset)) {
         return gb_timing_read(offset);
+    }
+    if (offset >= 0x10 && offset < 0x24) {
+        return sound_channels[offset - 0x10] | sound_read_mask[offset - 0x10];
+    }
+    if (offset >= 0x30 && offset < 0x40) {
+        return wave_ram[offset - 0x30];
     }
     switch (offset) {
     case 0x00:
@@ -287,7 +301,7 @@ static uint16_t read_high(uint8_t offset)
     case 0x53:
     case 0x54:
     case 0x55:
-        return 0xff;
+        return gb_vram_dma_read(offset);
     case 0x56:
         return gb_cgb ? gb_rp | 0x3e : 0xff; /* No infrared input. */
     case 0x70:
@@ -339,6 +353,16 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
         gb_timing_write(offset, value);
         return 1;
     }
+    if (offset >= 0x10 && offset < 0x24) {
+        if (gb_nr52) {
+            sound_channels[offset - 0x10] = value;
+        }
+        return 1;
+    }
+    if (offset >= 0x30 && offset < 0x40) {
+        wave_ram[offset - 0x30] = value;
+        return 1;
+    }
     switch (offset) {
     case 0x00:
         gb_joyp = value & 0x30;
@@ -373,6 +397,9 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
         if (!gb_nr52) {
             gb_nr50 = 0;
             gb_nr51 = 0;
+            for (unsigned i = 0; i < sizeof(sound_channels); ++i) {
+                sound_channels[i] = 0;
+            }
         }
         break;
     case 0x40:
@@ -735,20 +762,38 @@ uint8_t gb_set_hl_bit(uint8_t bit)
     return write_memory(address, (uint8_t)(value | (1U << bit)));
 }
 
-GbNativeBlock gb_lookup(uint24_t address)
+static GbNativeBlock lookup_address(const GbTargetBank *bank, uint16_t address)
 {
-    if (address >= 0x8000) {
-        return 0;
-    }
-    uint16_t bank = address < 0x4000 ? 0 : gb_rom_bank;
-    unsigned first = 0, last = gb_target_count;
+    unsigned first = bank->first, last = first + bank->count;
     while (first < last) {
         unsigned middle = first + (last - first) / 2;
         const GbTarget *target = &gb_targets[middle];
-        if (target->bank == bank && target->address == address) {
+        if (target->address == address) {
             return target->entry;
         }
-        if (target->bank < bank || (target->bank == bank && target->address < address)) {
+        if (target->address < address) {
+            first = middle + 1;
+        } else {
+            last = middle;
+        }
+    }
+    return 0;
+}
+
+GbNativeBlock gb_lookup(uint24_t address)
+{
+    if (address >= 0x8000 && (address < GB_HRAM_BASE || address >= 0xffff)) {
+        return 0;
+    }
+    uint16_t bank = address >= 0x4000 && address < 0x8000 ? gb_rom_bank : 0;
+    unsigned first = 0, last = gb_target_bank_count;
+    while (first < last) {
+        unsigned middle = first + (last - first) / 2;
+        const GbTargetBank *group = &gb_target_banks[middle];
+        if (group->bank == bank) {
+            return lookup_address(group, (uint16_t)address);
+        }
+        if (group->bank < bank) {
             first = middle + 1;
         } else {
             last = middle;

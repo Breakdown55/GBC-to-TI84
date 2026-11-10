@@ -1,16 +1,32 @@
 #include "vram_dma.h"
 #include "runtime.h"
+#include "timing.h"
+
+enum { BLOCK_SIZE = 16, HBLANK_MODE = 0x80 };
 
 static uint16_t source;
 static uint16_t destination;
+static uint8_t blocks_left;
+static uint8_t hblank_active;
 
-static uint8_t transfer(uint8_t control)
+void gb_vram_dma_reset(void)
 {
-    if (control & 0x80) {
-        return 0; /* HBlank DMA needs a timed transfer state. */
-    }
+    source = 0;
+    destination = 0;
+    blocks_left = 0;
+    hblank_active = 0;
+}
 
-    unsigned length = ((unsigned)control + 1) * 16;
+uint8_t gb_vram_dma_read(uint8_t offset)
+{
+    if (!gb_cgb || offset != 0x55 || !blocks_left) {
+        return 0xff;
+    }
+    return (hblank_active ? 0 : HBLANK_MODE) | (blocks_left - 1);
+}
+
+static uint8_t transfer(unsigned length)
+{
     unsigned source_end = (unsigned)source + length;
     unsigned destination_end = (unsigned)destination + length;
     if (destination_end > GB_VRAM_SIZE ||
@@ -29,7 +45,55 @@ static uint8_t transfer(uint8_t control)
         bytes[i] = (uint8_t)gb_read_byte(source + i);
     }
     source = source_end;
-    destination = destination_end & (GB_VRAM_SIZE - 1);
+    destination = destination_end;
+    return 1;
+}
+
+uint8_t gb_vram_dma_hblank(void)
+{
+    if (!hblank_active) {
+        return GB_VRAM_DMA_IDLE;
+    }
+    if (!transfer(BLOCK_SIZE)) {
+        hblank_active = 0;
+        return GB_VRAM_DMA_FAULT;
+    }
+    --blocks_left;
+    if (!blocks_left || destination == GB_VRAM_SIZE) {
+        hblank_active = 0;
+        destination &= GB_VRAM_SIZE - 1;
+    }
+    return GB_VRAM_DMA_COPIED;
+}
+
+static uint8_t start(uint8_t control)
+{
+    uint8_t length = (control & 0x7f) + 1;
+    if (!(control & HBLANK_MODE)) {
+        if (hblank_active) {
+            hblank_active = 0;
+            return 1;
+        }
+        if (!transfer((unsigned)length * BLOCK_SIZE)) {
+            return 0;
+        }
+        blocks_left = 0;
+        destination &= GB_VRAM_SIZE - 1;
+        gb_timing_stall((uint16_t)length * GB_VRAM_DMA_BLOCK_DOTS);
+        return 1;
+    }
+    if (!gb_timing_enabled) {
+        return 0;
+    }
+    hblank_active = 1;
+    blocks_left = length;
+    if (gb_timing_claim_hblank()) {
+        uint8_t result = gb_vram_dma_hblank();
+        if (result == GB_VRAM_DMA_FAULT) {
+            return 0;
+        }
+        gb_timing_stall(GB_VRAM_DMA_BLOCK_DOTS);
+    }
     return 1;
 }
 
@@ -43,7 +107,7 @@ uint8_t gb_vram_dma_write(uint8_t offset, uint8_t value)
     case 0x52: source = (source & 0xff00) | (value & 0xf0); break;
     case 0x53: destination = (destination & 0xf0) | ((uint16_t)(value & 0x1f) << 8); break;
     case 0x54: destination = (destination & 0x1f00) | (value & 0xf0); break;
-    case 0x55: return transfer(value);
+    case 0x55: return start(value);
     default: return 0;
     }
     return 1;
