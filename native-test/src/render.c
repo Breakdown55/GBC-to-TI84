@@ -24,12 +24,14 @@ static uint8_t graphics_cache[CACHE_BYTES];
 #define map_changed (tile_changed + TILE_COUNT)
 static bool background_valid;
 static bool incremental_background;
+static bool background_vram_dirty;
 
 void gb_video_invalidate(unsigned bank, unsigned offset, unsigned length)
 {
     /* All CPU stores and DMA writes invalidate the physical VRAM bank. Map
      * writes affect placement but do not invalidate decoded tile graphics. */
     gb_video_dirty = 1;
+    if (length) background_vram_dirty = true;
     if (length && offset < 0x1800) {
         unsigned end = offset + length;
         if (end > 0x1800) end = 0x1800;
@@ -89,6 +91,7 @@ void gb_video_init(void)
     memset(map_changed, 1, 2048);
     background_valid = false;
     incremental_background = false;
+    background_vram_dirty = true;
     memset(palettes[BG_PALETTE], 0xff, PALETTE_SIZE);
     memset(palettes[OBJ_PALETTE], 0, PALETTE_SIZE);
     memset(palette_indexes, 0, sizeof(palette_indexes));
@@ -276,11 +279,9 @@ static void render_background(uint8_t y, uint8_t *pixels)
     }
 }
 
-static void render_objects(uint8_t y, uint8_t *pixels)
+static unsigned select_objects(uint8_t y, int height, uint8_t objects[MAX_SCANLINE_OBJECTS])
 {
-    uint8_t objects[MAX_SCANLINE_OBJECTS];
     unsigned count = 0;
-    int height = (gb_lcdc & TALL_OBJ) ? 16 : 8;
     bool sort_by_x = !gb_cgb || obj_x_priority;
     unsigned band = y / OBJECT_BAND_HEIGHT;
     const uint8_t *candidates = band_objects[band];
@@ -298,7 +299,14 @@ static void render_objects(uint8_t y, uint8_t *pixels)
         }
         objects[index] = offset;
     }
+    return count;
+}
 
+static void render_objects(uint8_t y, uint8_t *pixels)
+{
+    uint8_t objects[MAX_SCANLINE_OBJECTS];
+    int height = (gb_lcdc & TALL_OBJ) ? 16 : 8;
+    unsigned count = select_objects(y, height, objects);
     if (!count) {
         return;
     }
@@ -374,6 +382,46 @@ static uint24_t saved_control, saved_base;
 static uint8_t previous_object_start, previous_object_end;
 static uint16_t saved_colors[COLOR_COUNT], saved_priority_colors[OBJ_INDEX];
 static uint8_t background_state[6];
+
+/* Compose in reverse priority order using the retained background as the
+ * underlay. A winning sprite hidden by the BG erases any lower sprite there. */
+static void compose_objects(uint8_t y, uint8_t *pixels, const uint8_t *background)
+{
+    uint8_t objects[MAX_SCANLINE_OBJECTS];
+    int height = gb_lcdc & TALL_OBJ ? 16 : 8;
+    unsigned count = select_objects(y, height, objects);
+    bool priority = !gb_cgb || (gb_lcdc & BG_ENABLE_PRIORITY);
+    while (count) {
+        const uint8_t *object = &gb_oam[objects[--count]];
+        int start = (int)object[1] - TILE_WIDTH;
+        if (start <= -TILE_WIDTH || start >= GB_SCREEN_WIDTH) continue;
+        unsigned first = start < 0 ? -start : 0;
+        unsigned end = start + TILE_WIDTH > GB_SCREEN_WIDTH ? GB_SCREEN_WIDTH - start : TILE_WIDTH;
+        uint8_t attributes = object[3];
+        unsigned row = y + 16 - object[0];
+        if (attributes & Y_FLIP) row = height - 1 - row;
+        unsigned tile = height == 16 ? object[2] & 0xfe : object[2];
+        unsigned bank = gb_cgb ? (attributes >> 3) & 1 : 0;
+        const uint8_t *source = decoded_tile(bank, tile + row / 8) + (row & 7) * TILE_WIDTH;
+        uint8_t base = OBJ_INDEX + ((gb_cgb ? attributes & 7 : (attributes >> 4) & 1) << 2);
+        bool flip = attributes & X_FLIP;
+        unsigned column = flip ? 7 - first : first;
+        int step = flip ? -1 : 1;
+        uint8_t *destination = pixels + (start + first);
+        const uint8_t *underlay = background + (start + first);
+        for (unsigned x = first; x < end; ++x) {
+            uint8_t color = source[column];
+            column += step;
+            if (color) {
+                uint8_t bg = *underlay;
+                *destination = priority && (bg & 3) && ((bg | attributes) & PRIORITY)
+                    ? bg : base | color;
+            }
+            ++destination;
+            ++underlay;
+        }
+    }
+}
 
 enum { BACKGROUND_TILE_SLOTS = 16 };
 static uint16_t background_tile_keys[BACKGROUND_TILE_SLOTS];
@@ -467,6 +515,51 @@ static void rebuild_background(void)
     }
 }
 
+/* On small scroll changes, shift the retained pixels and decode only the
+ * newly visible strips. Any VRAM edits still refresh their visible tiles. */
+static bool scroll_background(const uint8_t state[6])
+{
+    if (!background_valid || state[0] != background_state[0] ||
+        state[1] != background_state[1] || state[4] != background_state[4] ||
+        state[5] != background_state[5] ||
+        !(gb_lcdc & LCD_ENABLE) || (!gb_cgb && !(gb_lcdc & BG_ENABLE_PRIORITY)) ||
+        ((gb_lcdc & WINDOW_ENABLE) && gb_wy < GB_SCREEN_HEIGHT && gb_wx < GB_SCREEN_WIDTH + 7)) {
+        return false;
+    }
+    int dx = (int8_t)(gb_scx - background_state[2]);
+    int dy = (int8_t)(gb_scy - background_state[3]);
+    if ((!dx && !dy) || dx <= -TILE_WIDTH || dx >= TILE_WIDTH ||
+        dy <= -TILE_WIDTH || dy >= TILE_WIDTH) return false;
+
+    unsigned x = dx < 0 ? -dx : 0, y = dy < 0 ? -dy : 0;
+    unsigned source_x = dx > 0 ? dx : 0, source_y = dy > 0 ? dy : 0;
+    unsigned width = GB_SCREEN_WIDTH - x - source_x;
+    unsigned height = GB_SCREEN_HEIGHT - y - source_y;
+    for (unsigned i = 0; i < height; ++i) {
+        unsigned row = dy < 0 ? height - 1 - i : i;
+        memmove(background_pixels + (y + row) * GB_SCREEN_WIDTH + x,
+                background_pixels + (source_y + row) * GB_SCREEN_WIDTH + source_x, width);
+    }
+    unsigned map = gb_lcdc & BG_MAP ? 0x1c00 : 0x1800;
+    memset(background_tile_keys, 0xff, sizeof background_tile_keys);
+    if (background_vram_dirty) {
+        incremental_background = true;
+        background_region(x, y, width, height, gb_scx + x, gb_scy + y, map);
+        incremental_background = false;
+    }
+    if (dx) {
+        unsigned strip_x = dx < 0 ? 0 : width;
+        background_region(strip_x, y, GB_SCREEN_WIDTH - width, height,
+                          gb_scx + strip_x, gb_scy + y, map);
+    }
+    if (dy) {
+        unsigned strip_y = dy < 0 ? 0 : height;
+        background_region(0, strip_y, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT - height,
+                          gb_scx, gb_scy + strip_y, map);
+    }
+    return true;
+}
+
 static void refresh_palette(void)
 {
     uint16_t colors[COLOR_COUNT];
@@ -515,11 +608,14 @@ void gb_present_frame(void)
 
     if (full_redraw || !background_valid) {
         uint8_t state[] = {gb_cgb, gb_lcdc, gb_scx, gb_scy, gb_wx, gb_wy};
-        incremental_background = background_valid && !memcmp(state, background_state, sizeof state);
-        rebuild_background();
-        incremental_background = false;
+        if (!scroll_background(state)) {
+            incremental_background = background_valid && !memcmp(state, background_state, sizeof state);
+            rebuild_background();
+            incremental_background = false;
+        }
         memcpy(background_state, state, sizeof state);
         background_valid = true;
+        background_vram_dirty = false;
         memset(tile_changed, 0, TILE_COUNT);
         memset(map_changed, 0, 2048);
     }
@@ -556,9 +652,10 @@ void gb_present_frame(void)
             prepare_objects();
         }
         for (uint8_t y = first; y < end; ++y) {
-            memcpy(line, background_pixels + (unsigned)y * GB_SCREEN_WIDTH, GB_SCREEN_WIDTH);
+            const uint8_t *background = background_pixels + (unsigned)y * GB_SCREEN_WIDTH;
+            memcpy(line, background, GB_SCREEN_WIDTH);
             if ((gb_lcdc & (LCD_ENABLE | OBJ_ENABLE)) == (LCD_ENABLE | OBJ_ENABLE)) {
-                render_objects(y, line);
+                compose_objects(y, line, background);
             }
             line += LCD_WIDTH;
         }

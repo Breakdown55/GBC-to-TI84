@@ -71,7 +71,7 @@ int main(void)
             port(0x6a, i); port(0x6b, random_byte());
         }
         verify(scene, 0);
-        for (unsigned step = 1; step <= 12; ++step) {
+        for (unsigned step = 1; step <= 14; ++step) {
             switch (step) {
             case 1: break; /* No changes. */
             case 2: case 8: /* Only sprites move, including their old coverage. */
@@ -101,6 +101,18 @@ int main(void)
                 gb_lcdc ^= 0x0f; gb_video_dirty = 1; break;
             case 12:
                 gb_vram[1][0x1fff] ^= 0xff; gb_video_invalidate(1, 0x1fff, 1); break;
+            case 13:
+                gb_lcdc = (gb_lcdc | 0x91) & ~0x20;
+                gb_scx = 254; gb_scy = 2; gb_video_dirty = 1;
+                break;
+            case 14: /* Reuse the overlap across wrapping scroll and VRAM edits. */
+                gb_scx += 3; gb_scy -= 5;
+                for (unsigned bank = 0; bank < 2; ++bank) {
+                    unsigned map = gb_lcdc & 8 ? 0x1c00 : 0x1800;
+                    gb_vram[bank][map] ^= 0xff;
+                    gb_video_invalidate(bank, map, 1);
+                }
+                break;
             }
             verify(scene, step);
         }
@@ -109,8 +121,8 @@ int main(void)
         assert(!memcmp(saved, test_palette, sizeof saved));
         /* Re-enter after another screen owner overwrites all LCD cache memory. */
         memset(test_lcd, 0xa5, sizeof test_lcd);
-        verify(scene, 13);
+        verify(scene, 15);
         gb_end_frame();
     }
-    puts("672 cached frames match fresh scanline rendering; LCD state restored");
+    puts("768 cached frames match fresh scanline rendering; LCD state restored");
 }
