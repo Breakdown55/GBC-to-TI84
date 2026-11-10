@@ -26,7 +26,9 @@ Use `--stop-at BANK:ADDRESS` to stop before executing a reachable instruction. U
 
 `--vblank-preview [FRAMES]` is a graphics diagnostic. It advances to VBlank when the guest waits at `HALT` and displays the result after the requested number of handlers return. For routines copied to high RAM, `--ram-code START:BANK:SOURCE:LENGTH` supplies the ROM bytes used to translate and validate the executable copy. All four fields are hexadecimal.
 
-Renderer optimizations are automatic for every cartridge the compiler supports. The calculator displays 8-bit palette indices, so palette changes can update colors without redrawing pixels. The tile cache uses the guest's tile bytes and attributes. When only sprite memory changes, the renderer refreshes the rows covered by the old and new sprites. Changes to video RAM or display settings that affect pixel placement or priority trigger a full redraw.
+Renderer optimizations are automatic for every cartridge the compiler supports. The calculator displays 8-bit palette indices, so palette changes can update colors without redrawing pixels. A decoded-tile cache covers both video RAM banks, and a retained background layer avoids rebuilding the background beneath moving sprites. Background updates resolve map entries once per tile rectangle. CPU stores and DMA transfers invalidate the affected tiles and map cells. Changes to scrolling or display layout rebuild the background. Sprite composition preserves transparency, priority, flips, and the ten-sprites-per-scanline limit.
+
+These caches occupy 75,776 bytes in the unused half of LCD memory while the indexed display is active. They do not consume that amount of the program's code/data RAM. This remains a frame-based renderer; caching does not add scanline-accurate mid-frame video effects.
 
 The compiler also packs nearby cartridge data ranges together and shares repeated native instruction sequences in VBlank preview builds. It makes those decisions from the input ROM and generated code.
 
@@ -51,4 +53,4 @@ python native-test/test_rom.py --write native-test/bin/synthetic.gbc
 python native-test/recompile.py native-test/bin/synthetic.gbc native-test/bin/GBCRUN.8xp --watch c123
 ```
 
-The expected result is `HALT` and `RAM C123=A5`. Run `python -m unittest discover -s native-test` for the compiler regression tests.
+The expected result is `HALT` and `RAM C123=A5`. Run `python -m unittest discover -s native-test` for the regression tests. When host GCC is available, the suite also compares retained rendering with fresh scanline composition across scrolling, VRAM changes, sprites, palettes, and display re-entry.

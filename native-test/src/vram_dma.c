@@ -41,7 +41,7 @@ static uint8_t transfer(unsigned length)
     if (data) {
         if (memcmp(bytes, data, length)) {
             memcpy(bytes, data, length);
-            gb_video_dirty = 1;
+            gb_video_invalidate(gb_vbk, destination, length);
         }
     } else {
         /* Validate all bytes before writing when the source isn't contiguous. */
@@ -50,9 +50,15 @@ static uint8_t transfer(unsigned length)
                 return 0;
             }
         }
+        uint8_t changed = 0;
         for (unsigned i = 0; i < length; ++i) {
-            gb_video_store(&bytes[i], (uint8_t)gb_read_byte(source + i));
+            uint8_t value = (uint8_t)gb_read_byte(source + i);
+            if (bytes[i] != value) {
+                bytes[i] = value;
+                changed = 1;
+            }
         }
+        if (changed) gb_video_invalidate(gb_vbk, destination, length);
     }
     source = source_end;
     destination = destination_end;

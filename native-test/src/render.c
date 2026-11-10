@@ -4,6 +4,65 @@
 #include <stdbool.h>
 #include <string.h>
 
+#ifdef __TICE__
+#include <sys/lcd.h>
+#endif
+
+/* Indexed display uses only the first half of LCD RAM. Keep reusable graphics
+ * in the second half, outside the program's scarce code/data allocation. */
+enum { TILE_COUNT = 768, TILE_PIXELS = 64, BACKGROUND_BYTES = 160 * 144,
+       CACHE_BYTES = TILE_COUNT * TILE_PIXELS + BACKGROUND_BYTES + TILE_COUNT * 2 + 2048 };
+#ifdef __TICE__
+_Static_assert(CACHE_BYTES <= LCD_SIZE / 2, "graphics cache exceeds spare LCD RAM");
+#define graphics_cache ((uint8_t *)lcd_Ram + LCD_SIZE / 2)
+#else
+static uint8_t graphics_cache[CACHE_BYTES];
+#endif
+#define background_pixels (graphics_cache + TILE_COUNT * TILE_PIXELS)
+#define tile_valid (background_pixels + BACKGROUND_BYTES)
+#define tile_changed (tile_valid + TILE_COUNT)
+#define map_changed (tile_changed + TILE_COUNT)
+static bool background_valid;
+static bool incremental_background;
+
+void gb_video_invalidate(unsigned bank, unsigned offset, unsigned length)
+{
+    /* All CPU stores and DMA writes invalidate the physical VRAM bank. Map
+     * writes affect placement but do not invalidate decoded tile graphics. */
+    gb_video_dirty = 1;
+    if (length && offset < 0x1800) {
+        unsigned end = offset + length;
+        if (end > 0x1800) end = 0x1800;
+        unsigned first = offset / 16;
+        memset(tile_valid + bank * 384 + first, 0, (end - 1) / 16 - first + 1);
+        memset(tile_changed + bank * 384 + first, 1, (end - 1) / 16 - first + 1);
+    }
+    unsigned end = offset + length;
+    if (end > 0x1800) {
+        unsigned first = offset < 0x1800 ? 0x1800 : offset;
+        memset(map_changed + first - 0x1800, 1, end - first);
+    }
+}
+
+static const uint8_t *decoded_tile(unsigned bank, unsigned tile)
+{
+    unsigned index = bank * 384 + tile;
+    uint8_t *pixels = graphics_cache + index * TILE_PIXELS;
+    if (!tile_valid[index]) {
+        const uint8_t *source = &gb_vram[bank][tile * 16];
+        for (unsigned row = 0; row < 8; ++row) {
+            uint8_t low = *source++, high = *source++;
+            for (unsigned x = 0; x < 8; ++x) {
+                pixels[row * 8 + 7 - x] = (low & 1) | ((high & 1) << 1);
+                low >>= 1;
+                high >>= 1;
+            }
+        }
+        tile_valid[index] = 1;
+    }
+    return pixels;
+}
+
 enum {
     LCD_ENABLE = 0x80, WINDOW_MAP = 0x40, WINDOW_ENABLE = 0x20,
     UNSIGNED_TILES = 0x10, BG_MAP = 0x08, TALL_OBJ = 0x04,
@@ -25,6 +84,11 @@ static uint8_t palette_dirty;
 
 void gb_video_init(void)
 {
+    memset(tile_valid, 0, TILE_COUNT);
+    memset(tile_changed, 1, TILE_COUNT);
+    memset(map_changed, 1, 2048);
+    background_valid = false;
+    incremental_background = false;
     memset(palettes[BG_PALETTE], 0xff, PALETTE_SIZE);
     memset(palettes[OBJ_PALETTE], 0, PALETTE_SIZE);
     memset(palette_indexes, 0, sizeof(palette_indexes));
@@ -142,8 +206,9 @@ static void build_colors(uint16_t colors[COLOR_COUNT])
     colors[WHITE_INDEX] = 0xffff;
 }
 
-static const TileRow *background_row(const uint8_t *planes, uint8_t attributes)
+static const TileRow *background_row(unsigned bank, unsigned offset, uint8_t attributes)
 {
+    const uint8_t *planes = &gb_vram[bank][offset];
     uint8_t low = planes[0], high = planes[1];
     uint8_t key = (attributes & (PRIORITY | X_FLIP | 7)) | 0x10;
     unsigned slot = (low ^ (low >> 5) ^ high ^ (high >> 3) ^ key ^ (key >> 4)) & (ROW_CACHE_SIZE - 1);
@@ -154,14 +219,9 @@ static const TileRow *background_row(const uint8_t *planes, uint8_t attributes)
         row->high = high;
         uint8_t base = ((attributes & 7) << 2) | (attributes & PRIORITY);
         bool flip = attributes & X_FLIP;
-        unsigned column = flip ? 0 : 7;
-        int step = flip ? 1 : -1;
+        const uint8_t *decoded = decoded_tile(bank, offset / 16) + (offset & 14) * 4;
         for (unsigned i = 0; i < TILE_WIDTH; ++i) {
-            uint8_t color = (low & 1) | ((high & 1) << 1);
-            row->pixels[column] = base | color;
-            low >>= 1;
-            high >>= 1;
-            column += step;
+            row->pixels[i] = base | decoded[flip ? 7 - i : i];
         }
     }
     return row;
@@ -182,13 +242,16 @@ static void render_bg_span(uint8_t tile_x, uint8_t tile_y, unsigned map, unsigne
         unsigned bank = (attributes >> 3) & 1;
         unsigned offset = unsigned_tiles ? tile * 16 : 0x1000 + (int8_t)tile * 16;
         offset += attributes & Y_FLIP ? 14 - y_offset : y_offset;
-        const TileRow *row = background_row(&gb_vram[bank][offset], attributes);
         unsigned column = tile_x & 7;
         unsigned count = TILE_WIDTH - column;
         if (count > remaining) {
             count = remaining;
         }
-        memcpy(pixels, row->pixels + column, count);
+        if (!incremental_background || tile_changed[bank * 384 + offset / 16] ||
+            map_changed[map_row + cell - 0x1800]) {
+            const TileRow *row = background_row(bank, offset, attributes);
+            memcpy(pixels, row->pixels + column, count);
+        }
         pixels += count;
         tile_x += count;
         remaining -= count;
@@ -250,15 +313,15 @@ static void render_objects(uint8_t y, uint8_t *pixels)
         }
         unsigned tile = (height == 16) ? (object[2] & 0xfe) : object[2];
         unsigned bank = gb_cgb ? ((attributes >> 3) & 1) : 0;
-        const uint8_t *data = &gb_vram[bank][tile * 16 + row * 2];
+        const uint8_t *data = decoded_tile(bank, tile + row / 8) + (row & 7) * 8;
 
         uint8_t base = OBJ_INDEX + ((gb_cgb ? attributes & 7 : (attributes >> 4) & 1) << 2);
         bool priority = !gb_cgb || (gb_lcdc & BG_ENABLE_PRIORITY);
         bool flip = attributes & X_FLIP;
-        uint8_t mask = flip ? 1 : 0x80;
+        unsigned column = flip ? 7 : 0;
         for (int x = start; x < start + TILE_WIDTH; ++x) {
-            uint8_t color = ((data[0] & mask) != 0) | (((data[1] & mask) != 0) << 1);
-            mask = flip ? mask << 1 : mask >> 1;
+            uint8_t color = data[column];
+            column += flip ? -1 : 1;
             if (!color || x < 0 || x >= GB_SCREEN_WIDTH || claimed[x]) {
                 continue;
             }
@@ -299,7 +362,6 @@ void gb_render_scanline(uint8_t y, uint16_t pixels[GB_SCREEN_WIDTH])
 }
 
 #ifdef __TICE__
-#include <sys/lcd.h>
 
 enum {
     LCD_PIXEL_FORMAT = 7 << 1,
@@ -311,6 +373,61 @@ static bool frame_active;
 static uint24_t saved_control, saved_base;
 static uint8_t previous_object_start, previous_object_end;
 static uint16_t saved_colors[COLOR_COUNT], saved_priority_colors[OBJ_INDEX];
+static uint8_t background_state[6];
+
+/* Resolve map entries once per visible tile rectangle, rather than once per
+ * scanline. Partial tiles at scroll/window edges still use the same pixels. */
+static void background_region(unsigned x, unsigned y, unsigned width, unsigned height,
+                              uint8_t source_x, uint8_t source_y, unsigned map)
+{
+    while (height) {
+        unsigned rows = 8 - (source_y & 7);
+        if (rows > height) rows = height;
+        unsigned remaining = width, destination_x = x;
+        uint8_t sx = source_x;
+        unsigned map_row = map + (source_y >> 3) * 32;
+        while (remaining) {
+            unsigned cell = map_row + (sx >> 3);
+            uint8_t number = gb_vram[0][cell];
+            uint8_t attributes = gb_cgb ? gb_vram[1][cell] : 0;
+            unsigned bank = (attributes >> 3) & 1;
+            unsigned tile = gb_lcdc & UNSIGNED_TILES ? number : 256 + (int8_t)number;
+            unsigned columns = 8 - (sx & 7);
+            if (columns > remaining) columns = remaining;
+            if (!incremental_background || tile_changed[bank * 384 + tile] || map_changed[cell - 0x1800]) {
+                uint8_t *destination = background_pixels + y * GB_SCREEN_WIDTH + destination_x;
+                for (unsigned row = 0; row < rows; ++row) {
+                    unsigned tile_y = (source_y & 7) + row;
+                    if (attributes & Y_FLIP) tile_y = 7 - tile_y;
+                    const TileRow *decoded = background_row(bank, tile * 16 + tile_y * 2, attributes);
+                    memcpy(destination, decoded->pixels + (sx & 7), columns);
+                    destination += GB_SCREEN_WIDTH;
+                }
+            }
+            destination_x += columns; sx += columns; remaining -= columns;
+        }
+        y += rows; source_y += rows; height -= rows;
+    }
+}
+
+static void rebuild_background(void)
+{
+    if (!(gb_lcdc & LCD_ENABLE) || (!gb_cgb && !(gb_lcdc & BG_ENABLE_PRIORITY))) {
+        memset(background_pixels, WHITE_INDEX, BACKGROUND_BYTES);
+        return;
+    }
+    int window_x = (int)gb_wx - 7;
+    bool window = (gb_lcdc & WINDOW_ENABLE) && gb_wy < GB_SCREEN_HEIGHT && window_x < GB_SCREEN_WIDTH;
+    unsigned top = window ? gb_wy : GB_SCREEN_HEIGHT;
+    unsigned map = gb_lcdc & BG_MAP ? 0x1c00 : 0x1800;
+    background_region(0, 0, GB_SCREEN_WIDTH, top, gb_scx, gb_scy, map);
+    if (window) {
+        unsigned left = window_x < 0 ? 0 : window_x;
+        background_region(0, top, left, GB_SCREEN_HEIGHT - top, gb_scx, gb_scy + top, map);
+        background_region(left, top, GB_SCREEN_WIDTH - left, GB_SCREEN_HEIGHT - top,
+                          left - window_x, 0, gb_lcdc & WINDOW_MAP ? 0x1c00 : 0x1800);
+    }
+}
 
 static void refresh_palette(void)
 {
@@ -339,6 +456,9 @@ void gb_present_frame(void)
     }
     bool full_redraw = !frame_active || gb_video_dirty;
     if (!frame_active) {
+        /* TI-OS or another screen owner may have reused the entire LCD RAM. */
+        memset(tile_valid, 0, TILE_COUNT);
+        background_valid = false;
         saved_control = lcd_Control;
         saved_base = lcd_UpBase;
         volatile uint16_t *palette = lcd_Palette;
@@ -353,6 +473,17 @@ void gb_present_frame(void)
         lcd_UpBase = (uint24_t)lcd_Ram;
         lcd_Control = (saved_control & ~(LCD_PIXEL_FORMAT | LCD_PIXEL_ORDER)) | LCD_INDEXED8;
         frame_active = true;
+    }
+
+    if (full_redraw || !background_valid) {
+        uint8_t state[] = {gb_cgb, gb_lcdc, gb_scx, gb_scy, gb_wx, gb_wy};
+        incremental_background = background_valid && !memcmp(state, background_state, sizeof state);
+        rebuild_background();
+        incremental_background = false;
+        memcpy(background_state, state, sizeof state);
+        background_valid = true;
+        memset(tile_changed, 0, TILE_COUNT);
+        memset(map_changed, 0, 2048);
     }
 
     uint8_t object_start = GB_SCREEN_HEIGHT, object_end = 0;
@@ -387,7 +518,10 @@ void gb_present_frame(void)
             prepare_objects();
         }
         for (uint8_t y = first; y < end; ++y) {
-            render_scanline(y, line);
+            memcpy(line, background_pixels + (unsigned)y * GB_SCREEN_WIDTH, GB_SCREEN_WIDTH);
+            if ((gb_lcdc & (LCD_ENABLE | OBJ_ENABLE)) == (LCD_ENABLE | OBJ_ENABLE)) {
+                render_objects(y, line);
+            }
             line += LCD_WIDTH;
         }
     }
@@ -408,6 +542,8 @@ void gb_end_frame(void)
             palette[i | PRIORITY] = saved_priority_colors[i];
         }
         frame_active = false;
+        background_valid = false;
+        memset(tile_valid, 0, TILE_COUNT);
     }
 }
 #endif

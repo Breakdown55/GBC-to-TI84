@@ -709,7 +709,10 @@ static uint8_t write_memory(uint24_t address, uint8_t value)
     uint8_t *byte = ram_byte(address);
     if (byte) {
         if (address < 0xa000) {
-            gb_video_store(byte, value);
+            if (*byte != value) {
+                *byte = value;
+                gb_video_invalidate(gb_cgb ? gb_vbk : 0, address - GB_VRAM_BASE, 1);
+            }
         } else if (address >= 0xfe00 && address < 0xfe00 + GB_OAM_SIZE) {
             gb_oam_store(address - 0xfe00, value);
         } else {

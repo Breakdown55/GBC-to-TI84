@@ -32,6 +32,8 @@ static inline void gb_oam_store(unsigned offset, uint8_t value)
 }
 
 void gb_video_init(void);
+/* Call after changing a physical VRAM range, including DMA destinations. */
+void gb_video_invalidate(unsigned bank, unsigned offset, unsigned length);
 uint8_t gb_video_read(uint8_t offset);
 void gb_video_write(uint8_t offset, uint8_t value);
 
