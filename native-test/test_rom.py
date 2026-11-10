@@ -369,6 +369,15 @@ class RomTest(unittest.TestCase):
         self.assertIn("ld a, (_gb_hram+0)", assembly)
         self.assertIn("ld hl, 0x4000\n    push hl\n    call _gb_load_a", assembly)
 
+    def test_timed_calls_only_bypass_dispatch_for_known_targets(self):
+        data = cartridge_image()
+        data[0x100:0x108] = bytes.fromhex("af cc 00 02 cd 00 40 76")
+        data[0x200] = data[BANK_SIZE] = 0xc9
+        assembly, _ = compile_rom(data, stop_at=(0, 0x108), timing=True)
+        self.assertIn("ld a, 12\n    ld (_gb_timing_extra), a\n"
+                      "    ld hl, _gb_000_0200\n    ld de, 0x0104\n    jp _gb_call_native", assembly)
+        self.assertIn("ld hl, 0x4000\n    ld de, 0x0107\n    jp _gb_call\n", assembly)
+
     def test_live_input_keeps_the_pressed_branch_after_the_delay(self):
         data, (_, resume) = frame_rom()
         # Select buttons, then skip the marker write when A is released.

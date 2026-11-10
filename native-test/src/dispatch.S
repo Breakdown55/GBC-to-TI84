@@ -3,6 +3,17 @@
     .global _gb_dispatch
     .global _gb_ret
     .global _gb_call
+    .global _gb_call_native
+
+_gb_call_native:
+    push hl             ; Preserve the proven native target while pushing the guest return.
+    push de
+    call _gb_push_word
+    pop bc
+    pop hl
+    or a, a
+    jp z, _gb_unmapped
+    jp (hl)
 
 _gb_call:
     push hl             ; Save the target across the helper call.

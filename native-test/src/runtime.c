@@ -3,6 +3,7 @@
 #include "timing.h"
 #include "vram_dma.h"
 #include <stdbool.h>
+#include <string.h>
 
 enum {
     GB_FLAG_Z = 0x80,
@@ -360,15 +361,20 @@ static uint8_t transfer_oam(uint8_t page)
     }
     uint16_t source = (uint16_t)page << 8;
     uint8_t bytes[GB_OAM_SIZE];
-    for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
-        uint16_t value = read_memory(source + i);
-        if (value == GB_UNMAPPED_BYTE) {
-            return 0;
+    const uint8_t *data = gb_read_contiguous(source, GB_OAM_SIZE);
+    if (!data) {
+        for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
+            uint16_t value = read_memory(source + i);
+            if (value == GB_UNMAPPED_BYTE) {
+                return 0;
+            }
+            bytes[i] = (uint8_t)value;
         }
-        bytes[i] = (uint8_t)value;
+        data = bytes;
     }
-    for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
-        gb_oam_store(i, bytes[i]);
+    if (memcmp(gb_oam, data, GB_OAM_SIZE)) {
+        memcpy(gb_oam, data, GB_OAM_SIZE);
+        gb_oam_dirty = 1;
     }
     gb_dma = page;
     return 1;
@@ -562,13 +568,13 @@ uint8_t gb_watch_ram(uint16_t address)
     return byte ? *byte : 0xff;
 }
 
-static uint16_t read_rom(uint16_t address)
+static const GbRomSpan *find_rom_span(uint16_t address)
 {
     static const GbRomSpan *last_span;
     uint16_t bank = address < 0x4000 ? 0 : gb_rom_bank;
     if (last_span && last_span->bank == bank &&
         (uint16_t)(address - last_span->address) < last_span->length) {
-        return gb_rom_payload[last_span->offset + address - last_span->address];
+        return last_span;
     }
     unsigned first = 0, last = gb_rom_data_count;
     while (first < last) {
@@ -579,11 +585,24 @@ static uint16_t read_rom(uint16_t address)
         } else if (span->bank > bank || address < span->address) {
             last = middle;
         } else {
-            last_span = span;
-            return gb_rom_payload[span->offset + address - span->address];
+            return last_span = span;
         }
     }
-    return GB_UNMAPPED_BYTE;
+    return 0;
+}
+
+const uint8_t *gb_read_contiguous(uint16_t address, unsigned length)
+{
+    if (address < 0x8000 && length <= 0x4000 - (address & 0x3fff)) {
+        const GbRomSpan *span = find_rom_span(address);
+        if (span && length <= span->length - (address - span->address)) {
+            return gb_rom_payload + span->offset + (address - span->address);
+        }
+    } else if (address >= GB_WRAM_BASE && address < 0xe000 &&
+               length <= GB_WRAM_SIZE - (address & (GB_WRAM_SIZE - 1))) {
+        return work_or_high_ram_byte(address);
+    }
+    return 0;
 }
 
 static uint24_t sram_offset(uint24_t address)
@@ -591,14 +610,21 @@ static uint24_t sram_offset(uint24_t address)
     return (((uint24_t)sram_bank << 13) | (address & 0x1fff)) & (gb_sram_size - 1);
 }
 
+static uint16_t last_sram_page = UINT16_MAX;
+static SramPage *last_sram_slot;
+
 static SramPage *find_sram_page(uint16_t number)
 {
+    if (last_sram_page == number) {
+        return last_sram_slot;
+    }
+    last_sram_page = number;
     for (unsigned i = 0; i < sram_page_count; ++i) {
         if (sram_pages[i].number == number) {
-            return &sram_pages[i];
+            return last_sram_slot = &sram_pages[i];
         }
     }
-    return 0;
+    return last_sram_slot = 0;
 }
 
 static uint8_t read_sram(uint24_t address)
@@ -629,6 +655,7 @@ static uint8_t write_sram(uint24_t address, uint8_t value)
             return 0;
         }
         page = &sram_pages[sram_page_count++];
+        last_sram_slot = page;
         page->number = number;
         page->matches = SRAM_PAGE_SIZE;
         for (unsigned i = 0; i < SRAM_PAGE_SIZE; ++i) {
@@ -653,6 +680,7 @@ static uint8_t write_sram(uint24_t address, uint8_t value)
     if (page->matches == SRAM_PAGE_SIZE) {
         sram_fill[number] = value ^ 0xff;
         *page = sram_pages[--sram_page_count];
+        last_sram_slot = 0;
     }
     return 1;
 }
@@ -660,7 +688,8 @@ static uint8_t write_sram(uint24_t address, uint8_t value)
 static uint16_t read_memory(uint24_t address)
 {
     if (address < 0x8000) {
-        return read_rom((uint16_t)address);
+        const GbRomSpan *span = find_rom_span((uint16_t)address);
+        return span ? gb_rom_payload[span->offset + address - span->address] : GB_UNMAPPED_BYTE;
     }
     uint8_t *byte = ram_byte(address);
     if (byte) {
@@ -828,12 +857,26 @@ GbNativeBlock gb_lookup(uint24_t address)
         return 0;
     }
     uint16_t bank = address >= 0x4000 && address < 0x8000 ? gb_rom_bank : 0;
+    enum { CACHE_SIZE = 32 };
+    static struct {
+        GbNativeBlock entry;
+        uint16_t address, bank;
+        uint8_t padding;
+    } cache[CACHE_SIZE];
+    unsigned slot = (address ^ (address >> 5) ^ bank) & (CACHE_SIZE - 1);
+    if (cache[slot].entry && cache[slot].bank == bank && cache[slot].address == address) {
+        return cache[slot].entry;
+    }
     unsigned first = 0, last = gb_target_bank_count;
     while (first < last) {
         unsigned middle = first + (last - first) / 2;
         const GbTargetBank *group = &gb_target_banks[middle];
         if (group->bank == bank) {
-            return lookup_address(group, (uint16_t)address);
+            GbNativeBlock entry = lookup_address(group, (uint16_t)address);
+            cache[slot].address = address;
+            cache[slot].bank = bank;
+            cache[slot].entry = entry;
+            return entry;
         }
         if (group->bank < bank) {
             first = middle + 1;
@@ -847,13 +890,19 @@ GbNativeBlock gb_lookup(uint24_t address)
 uint8_t gb_push_word(uint24_t value)
 {
     uint16_t sp = gb_sp;
-    uint8_t *high = work_or_high_ram_byte((uint16_t)(sp - 1));
-    uint8_t *low = work_or_high_ram_byte((uint16_t)(sp - 2));
-    if (!low || !high) {
-        return 0;
+    uint16_t offset = sp - 2 - GB_WRAM_BASE;
+    if (offset < GB_WRAM_SIZE - 1) {
+        gb_wram[offset] = (uint8_t)value;
+        gb_wram[offset + 1] = (uint8_t)(value >> 8);
+    } else {
+        uint8_t *high = work_or_high_ram_byte((uint16_t)(sp - 1));
+        uint8_t *low = work_or_high_ram_byte((uint16_t)(sp - 2));
+        if (!low || !high) {
+            return 0;
+        }
+        *high = (uint8_t)(value >> 8);
+        *low = (uint8_t)value;
     }
-    *high = (uint8_t)(value >> 8);
-    *low = (uint8_t)value;
     gb_sp = sp - 2;
     return 1;
 }
@@ -861,12 +910,18 @@ uint8_t gb_push_word(uint24_t value)
 uint24_t gb_pop_word(void)
 {
     uint16_t sp = gb_sp;
-    uint8_t *low = work_or_high_ram_byte(sp);
-    uint8_t *high = work_or_high_ram_byte((uint16_t)(sp + 1));
-    if (!low || !high) {
-        return 0x10000; /* Outside the guest address space. */
+    uint16_t offset = sp - GB_WRAM_BASE;
+    uint16_t value;
+    if (offset < GB_WRAM_SIZE - 1) {
+        value = gb_wram[offset] | ((uint16_t)gb_wram[offset + 1] << 8);
+    } else {
+        uint8_t *low = work_or_high_ram_byte(sp);
+        uint8_t *high = work_or_high_ram_byte((uint16_t)(sp + 1));
+        if (!low || !high) {
+            return 0x10000; /* Outside the guest address space. */
+        }
+        value = *low | ((uint16_t)*high << 8);
     }
-    uint16_t value = *low | ((uint16_t)*high << 8);
     gb_sp = sp + 2;
     return value;
 }

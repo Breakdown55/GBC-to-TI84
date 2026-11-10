@@ -77,7 +77,14 @@ def high_address(operand):
     return None
 
 
-def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=False, vblank_preview=False):
+def call_sequence(address, resume, native_target):
+    target = native_target or f"0x{address:04x}"
+    helper = "_gb_call_native" if native_target else "_gb_call"
+    return [f"ld hl, {target}", f"ld de, 0x{resume:04x}", f"jp {helper}"]
+
+
+def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=False,
+                      vblank_preview=False, native_target=None):
     normalized = instruction.lower()
     parts = normalized.split()
     # A byte count advances the Game Boy PC. None ends the native block.
@@ -351,9 +358,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             if pc is None:
                 raise ValueError(f"{parts[0].upper()} needs an address-bearing entry label like gb_000_0800")
             return_address = (pc + (1 if parts[0] == "rst" else 3)) & 0xffff
-            return [
-                f"ld hl, 0x{address:04x}", f"ld de, 0x{return_address:04x}", "jp _gb_call"
-            ], None
+            return call_sequence(address, return_address, native_target), None
     conditional_jump = re.fullmatch(r"(jr|jp|call)\s+(nz|z|nc|c)\s*,\s*(\S+)", normalized)
     if conditional_jump:
         operation, condition, target = conditional_jump.groups()
@@ -372,7 +377,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             if operation == "call":
                 return [
                     "ld a, (_gb_f)", f"bit {bit}, a", f"jr {native_condition}, 1f", *taken,
-                    f"ld hl, 0x{address:04x}", f"ld de, 0x{fallthrough:04x}", "jp _gb_call", "1:",
+                    *call_sequence(address, fallthrough, native_target), "1:",
                 ], 3
             return [
                 f"ld hl, 0x{fallthrough:04x}",

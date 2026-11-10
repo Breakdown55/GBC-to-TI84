@@ -1057,28 +1057,29 @@ def symbol(bank, pc):
     return f"gb_{bank:03x}_{pc:04x}"
 
 
+def native_destination(bank, pc, address, instructions):
+    if BANK_SIZE <= address < 2 * BANK_SIZE:
+        if not BANK_SIZE <= pc < 2 * BANK_SIZE:
+            return None
+        key = bank, address
+    else:
+        key = 0, address
+    return key if key in instructions else None
+
+
 def direct_branch(bank, pc, instruction, instructions):
     opcode = instruction.opcode
     if opcode not in (0x18, 0xc3, *CONDITIONAL_JR, *CONDITIONAL_JP):
         return None
 
-    def destination(address):
-        if BANK_SIZE <= address < 2 * BANK_SIZE:
-            if not BANK_SIZE <= pc < 2 * BANK_SIZE:
-                return None
-            key = bank, address
-        else:
-            key = 0, address
-        return key if key in instructions else None
-
-    taken = destination(instruction.operand)
+    taken = native_destination(bank, pc, instruction.operand, instructions)
     if taken is None:
         return None
     if opcode in (0x18, 0xc3):
         return [f"jp _{symbol(*taken)}"]
 
     next_pc = pc + instruction.size
-    fallthrough = destination(next_pc)
+    fallthrough = native_destination(bank, pc, next_pc, instructions)
     if fallthrough is None:
         return None
     flag = 4 if opcode & 0x10 else 7
@@ -1235,8 +1236,14 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             native.append(f"call _gb_at_pc_{helper}")
             size = instruction.size
         else:
+            callee = None
+            if opcode in (0xcd, *CONDITIONAL_CALL) or opcode & 0xc7 == 0xc7:
+                target = native_destination(bank, pc, instruction.operand, instructions)
+                if target is not None:
+                    callee = f"_{symbol(*target)}"
             native, size = lower_instruction(instruction.text, pc, timing=timing,
-                                             live_immediate=live_immediate, vblank_preview=vblank_preview)
+                                             live_immediate=live_immediate, vblank_preview=vblank_preview,
+                                             native_target=callee)
         # The shared fault exit unwinds its own return address before stopping the guest.
         if (vblank_preview and size is not None and not checked and not in_ram and len(native) > 1
                 and all(line in OUTLINE_FAULT_BRANCHES or not line.startswith(("jp ", "ret", "djnz "))

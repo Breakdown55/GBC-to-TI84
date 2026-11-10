@@ -2,6 +2,7 @@
 #include "runtime.h"
 #include "render.h"
 #include "timing.h"
+#include <string.h>
 
 enum { BLOCK_SIZE = 16, HBLANK_MODE = 0x80 };
 
@@ -35,15 +36,23 @@ static uint8_t transfer(unsigned length)
         return 0;
     }
 
-    /* ROM data may have been omitted by the static recompiler. Check before writing. */
-    for (unsigned i = 0; i < length; ++i) {
-        if (gb_read_byte(source + i) > 0xff) {
-            return 0;
-        }
-    }
     uint8_t *bytes = &gb_vram[gb_vbk][destination];
-    for (unsigned i = 0; i < length; ++i) {
-        gb_video_store(&bytes[i], (uint8_t)gb_read_byte(source + i));
+    const uint8_t *data = gb_read_contiguous(source, length);
+    if (data) {
+        if (memcmp(bytes, data, length)) {
+            memcpy(bytes, data, length);
+            gb_video_dirty = 1;
+        }
+    } else {
+        /* Validate all bytes before writing when the source isn't contiguous. */
+        for (unsigned i = 0; i < length; ++i) {
+            if (gb_read_byte(source + i) > 0xff) {
+                return 0;
+            }
+        }
+        for (unsigned i = 0; i < length; ++i) {
+            gb_video_store(&bytes[i], (uint8_t)gb_read_byte(source + i));
+        }
     }
     source = source_end;
     destination = destination_end;

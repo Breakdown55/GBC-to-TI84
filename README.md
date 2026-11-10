@@ -26,7 +26,7 @@ Use `--stop-at BANK:ADDRESS` to stop before executing a reachable instruction. U
 
 `--vblank-preview [FRAMES]` is a graphics diagnostic. It advances to VBlank when the guest waits at `HALT` and displays the result after the requested number of handlers return. For routines copied to high RAM, `--ram-code START:BANK:SOURCE:LENGTH` supplies the ROM bytes used to translate and validate the executable copy. All four fields are hexadecimal.
 
-Renderer optimizations are automatic for every cartridge the compiler supports. The tile cache uses the guest's tile bytes, attributes, and current palettes. When only sprite memory changes, the renderer refreshes the rows covered by the old and new sprites. Changes to video RAM, palettes, or display registers trigger a full redraw.
+Renderer optimizations are automatic for every cartridge the compiler supports. The calculator displays 8-bit palette indices, so palette changes can update colors without redrawing pixels. The tile cache uses the guest's tile bytes and attributes. When only sprite memory changes, the renderer refreshes the rows covered by the old and new sprites. Changes to video RAM or display settings that affect pixel placement or priority trigger a full redraw.
 
 The compiler also packs nearby cartridge data ranges together and shares repeated native instruction sequences in VBlank preview builds. It makes those decisions from the input ROM and generated code.
 

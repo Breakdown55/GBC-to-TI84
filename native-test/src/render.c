@@ -10,7 +10,8 @@ enum {
     OBJ_ENABLE = 0x02, BG_ENABLE_PRIORITY = 0x01,
     BGPI = 0x68, BGPD = 0x69, OBPI = 0x6a, OBPD = 0x6b, OPRI = 0x6c,
     BG_PALETTE = 0, OBJ_PALETTE = 1, PALETTE_SIZE = 64,
-    X_FLIP = 0x20, Y_FLIP = 0x40, PRIORITY = 0x80, OBJ_CLAIMED = 0x04,
+    X_FLIP = 0x20, Y_FLIP = 0x40, PRIORITY = 0x80,
+    OBJ_INDEX = 32, BLACK_INDEX = 64, WHITE_INDEX = 68, COLOR_COUNT = WHITE_INDEX + 1,
     MAX_SCANLINE_OBJECTS = 10,
 };
 
@@ -20,6 +21,7 @@ uint8_t gb_oam_dirty;
 static uint8_t palettes[2][PALETTE_SIZE];
 static uint8_t palette_indexes[2];
 static uint8_t bgp, obp0, obp1, obj_x_priority;
+static uint8_t palette_dirty;
 
 void gb_video_init(void)
 {
@@ -30,7 +32,7 @@ void gb_video_init(void)
     bgp = 0xfc;
     obp0 = obp1 = 0xff;
     obj_x_priority = 0;
-    gb_video_dirty = 1;
+    gb_video_dirty = palette_dirty = 1;
 }
 
 uint8_t gb_video_read(uint8_t offset)
@@ -51,7 +53,7 @@ uint8_t gb_video_read(uint8_t offset)
 static void write_palette(unsigned group, uint8_t value)
 {
     uint8_t index = palette_indexes[group];
-    gb_video_store(&palettes[group][index & 0x3f], value);
+    gb_video_store_dirty(&palettes[group][index & 0x3f], value, &palette_dirty);
     if (index & 0x80) {
         palette_indexes[group] = 0x80 | ((index + 1) & 0x3f);
     }
@@ -60,9 +62,9 @@ static void write_palette(unsigned group, uint8_t value)
 void gb_video_write(uint8_t offset, uint8_t value)
 {
     switch (offset) {
-    case 0x47: gb_video_store(&bgp, value); return;
-    case 0x48: gb_video_store(&obp0, value); return;
-    case 0x49: gb_video_store(&obp1, value); return;
+    case 0x47: gb_video_store_dirty(&bgp, value, &palette_dirty); return;
+    case 0x48: gb_video_store_dirty(&obp0, value, &palette_dirty); return;
+    case 0x49: gb_video_store_dirty(&obp1, value, &palette_dirty); return;
     default: break;
     }
     if (!gb_cgb) {
@@ -99,15 +101,12 @@ enum {
 };
 
 typedef struct {
-    uint16_t pixels[TILE_WIDTH];
-    uint8_t background[TILE_WIDTH];
+    uint8_t pixels[TILE_WIDTH];
     uint8_t attributes, low, high;
     uint8_t padding[5]; /* Keep the cache stride a power of two on eZ80. */
 } TileRow;
 
 static TileRow row_cache[ROW_CACHE_SIZE];
-static uint16_t bg_colors[8][4];
-static uint16_t obj_colors[8][4];
 static uint8_t band_objects[OBJECT_BANDS][OAM_OBJECTS];
 static uint8_t band_counts[OBJECT_BANDS];
 
@@ -130,27 +129,17 @@ static void prepare_objects(void)
     }
 }
 
-static void prepare_frame(void)
+static void build_colors(uint16_t colors[COLOR_COUNT])
 {
-    /* Cached rows use the palette values from this presentation only. */
-    for (unsigned i = 0; i < ROW_CACHE_SIZE; ++i) {
-        row_cache[i].attributes = 0;
-    }
-    unsigned count = gb_cgb ? 8 : 1;
-    for (unsigned palette = 0; palette < count; ++palette) {
+    for (unsigned palette = 0; palette < 8; ++palette) {
         for (unsigned color = 0; color < 4; ++color) {
-            bg_colors[palette][color] = palette_color(BG_PALETTE, palette, color);
+            colors[palette * 4 + color] = palette_color(BG_PALETTE, palette, color);
+            colors[OBJ_INDEX + palette * 4 + color] =
+                palette_color(OBJ_PALETTE, gb_cgb ? palette : palette << 4, color);
         }
     }
-    if (gb_lcdc & OBJ_ENABLE) {
-        prepare_objects();
-        count = gb_cgb ? 8 : 2;
-        for (unsigned palette = 0; palette < count; ++palette) {
-            for (unsigned color = 1; color < 4; ++color) {
-                obj_colors[palette][color] = palette_color(OBJ_PALETTE, gb_cgb ? palette : palette << 4, color);
-            }
-        }
-    }
+    memset(colors + BLACK_INDEX, 0, (COLOR_COUNT - BLACK_INDEX) * sizeof(*colors));
+    colors[WHITE_INDEX] = 0xffff;
 }
 
 static const TileRow *background_row(const uint8_t *planes, uint8_t attributes)
@@ -163,15 +152,13 @@ static const TileRow *background_row(const uint8_t *planes, uint8_t attributes)
         row->attributes = key;
         row->low = low;
         row->high = high;
-        const uint16_t *palette = bg_colors[attributes & 7];
-        uint8_t priority = attributes & PRIORITY;
+        uint8_t base = ((attributes & 7) << 2) | (attributes & PRIORITY);
         bool flip = attributes & X_FLIP;
         unsigned column = flip ? 0 : 7;
         int step = flip ? 1 : -1;
         for (unsigned i = 0; i < TILE_WIDTH; ++i) {
             uint8_t color = (low & 1) | ((high & 1) << 1);
-            row->background[column] = color | priority;
-            row->pixels[column] = palette[color];
+            row->pixels[column] = base | color;
             low >>= 1;
             high >>= 1;
             column += step;
@@ -181,7 +168,7 @@ static const TileRow *background_row(const uint8_t *planes, uint8_t attributes)
 }
 
 static void render_bg_span(uint8_t tile_x, uint8_t tile_y, unsigned map, unsigned remaining,
-                           uint16_t *pixels, uint8_t *background)
+                           uint8_t *pixels)
 {
     unsigned map_row = map + (tile_y >> 3) * 32;
     const uint8_t *tiles = &gb_vram[0][map_row];
@@ -201,24 +188,17 @@ static void render_bg_span(uint8_t tile_x, uint8_t tile_y, unsigned map, unsigne
         if (count > remaining) {
             count = remaining;
         }
-        memcpy(pixels, row->pixels + column, count * sizeof(*pixels));
-        if (background) {
-            memcpy(background, row->background + column, count);
-            background += count;
-        }
+        memcpy(pixels, row->pixels + column, count);
         pixels += count;
         tile_x += count;
         remaining -= count;
     }
 }
 
-static void render_background(uint8_t y, uint16_t *pixels, uint8_t *background)
+static void render_background(uint8_t y, uint8_t *pixels)
 {
     if (!gb_cgb && !(gb_lcdc & BG_ENABLE_PRIORITY)) {
-        if (background) {
-            memset(background, 0, GB_SCREEN_WIDTH);
-        }
-        memset(pixels, 0xff, GB_SCREEN_WIDTH * sizeof(*pixels));
+        memset(pixels, WHITE_INDEX, GB_SCREEN_WIDTH);
         return;
     }
 
@@ -226,15 +206,14 @@ static void render_background(uint8_t y, uint16_t *pixels, uint8_t *background)
     bool window = (gb_lcdc & WINDOW_ENABLE) && y >= gb_wy && window_x < GB_SCREEN_WIDTH;
     unsigned bg_width = window ? (window_x < 0 ? 0 : window_x) : GB_SCREEN_WIDTH;
     render_bg_span(gb_scx, y + gb_scy, (gb_lcdc & BG_MAP) ? 0x1c00 : 0x1800,
-                   bg_width, pixels, background);
+                   bg_width, pixels);
     if (window) {
         render_bg_span(bg_width - window_x, y - gb_wy, (gb_lcdc & WINDOW_MAP) ? 0x1c00 : 0x1800,
-                       GB_SCREEN_WIDTH - bg_width, pixels + bg_width,
-                       background ? background + bg_width : NULL);
+                       GB_SCREEN_WIDTH - bg_width, pixels + bg_width);
     }
 }
 
-static void render_objects(uint8_t y, uint16_t *pixels, uint8_t *background)
+static void render_objects(uint8_t y, uint8_t *pixels)
 {
     uint8_t objects[MAX_SCANLINE_OBJECTS];
     unsigned count = 0;
@@ -257,6 +236,10 @@ static void render_objects(uint8_t y, uint16_t *pixels, uint8_t *background)
         objects[index] = offset;
     }
 
+    if (!count) {
+        return;
+    }
+    uint8_t claimed[GB_SCREEN_WIDTH] = {0};
     for (unsigned index = 0; index < count; ++index) {
         const uint8_t *object = &gb_oam[objects[index]];
         int start = (int)object[1] - 8;
@@ -269,44 +252,50 @@ static void render_objects(uint8_t y, uint16_t *pixels, uint8_t *background)
         unsigned bank = gb_cgb ? ((attributes >> 3) & 1) : 0;
         const uint8_t *data = &gb_vram[bank][tile * 16 + row * 2];
 
-        const uint16_t *palette = obj_colors[gb_cgb ? (attributes & 7) : ((attributes >> 4) & 1)];
+        uint8_t base = OBJ_INDEX + ((gb_cgb ? attributes & 7 : (attributes >> 4) & 1) << 2);
         bool priority = !gb_cgb || (gb_lcdc & BG_ENABLE_PRIORITY);
         bool flip = attributes & X_FLIP;
         uint8_t mask = flip ? 1 : 0x80;
         for (int x = start; x < start + TILE_WIDTH; ++x) {
             uint8_t color = ((data[0] & mask) != 0) | (((data[1] & mask) != 0) << 1);
             mask = flip ? mask << 1 : mask >> 1;
-            if (!color || x < 0 || x >= GB_SCREEN_WIDTH || (background[x] & OBJ_CLAIMED)) {
+            if (!color || x < 0 || x >= GB_SCREEN_WIDTH || claimed[x]) {
                 continue;
             }
-            uint8_t bg = background[x];
-            background[x] |= OBJ_CLAIMED;
+            uint8_t bg = pixels[x];
+            claimed[x] = 1;
             if (!(priority && (bg & 3) && ((bg | attributes) & PRIORITY))) {
-                pixels[x] = palette[color];
+                pixels[x] = base | color;
             }
         }
     }
 }
 
-static void render_scanline(uint8_t y, uint16_t pixels[GB_SCREEN_WIDTH])
+static void render_scanline(uint8_t y, uint8_t pixels[GB_SCREEN_WIDTH])
 {
     if (!(gb_lcdc & LCD_ENABLE) || y >= GB_SCREEN_HEIGHT) {
-        memset(pixels, 0xff, GB_SCREEN_WIDTH * sizeof(*pixels));
+        memset(pixels, WHITE_INDEX, GB_SCREEN_WIDTH);
         return;
     }
 
-    uint8_t background[GB_SCREEN_WIDTH];
-    bool objects = gb_lcdc & OBJ_ENABLE;
-    render_background(y, pixels, objects ? background : NULL);
-    if (objects) {
-        render_objects(y, pixels, background);
+    render_background(y, pixels);
+    if (gb_lcdc & OBJ_ENABLE) {
+        render_objects(y, pixels);
     }
 }
 
 void gb_render_scanline(uint8_t y, uint16_t pixels[GB_SCREEN_WIDTH])
 {
-    prepare_frame();
-    render_scanline(y, pixels);
+    uint16_t colors[COLOR_COUNT];
+    uint8_t indices[GB_SCREEN_WIDTH];
+    build_colors(colors);
+    if (gb_lcdc & OBJ_ENABLE) {
+        prepare_objects();
+    }
+    render_scanline(y, indices);
+    for (unsigned x = 0; x < GB_SCREEN_WIDTH; ++x) {
+        pixels[x] = colors[indices[x] & ~PRIORITY];
+    }
 }
 
 #ifdef __TICE__
@@ -315,15 +304,36 @@ void gb_render_scanline(uint8_t y, uint16_t pixels[GB_SCREEN_WIDTH])
 enum {
     LCD_PIXEL_FORMAT = 7 << 1,
     LCD_PIXEL_ORDER = 7 << 8,
-    LCD_RGB565 = (6 << 1) | (1 << 8),
+    LCD_INDEXED8 = (3 << 1) | (1 << 8),
 };
 
 static bool frame_active;
 static uint24_t saved_control, saved_base;
 static uint8_t previous_object_start, previous_object_end;
+static uint16_t saved_colors[COLOR_COUNT], saved_priority_colors[OBJ_INDEX];
+
+static void refresh_palette(void)
+{
+    uint16_t colors[COLOR_COUNT];
+    volatile uint16_t *palette = lcd_Palette;
+    build_colors(colors);
+    for (unsigned i = 0; i < COLOR_COUNT; ++i) {
+        uint16_t rgb565 = colors[i];
+        uint16_t rgb1555 = (rgb565 & 31) | ((rgb565 >> 1) & 0x7fe0) | ((rgb565 & 0x20) << 10);
+        palette[i] = rgb1555;
+        if (i < OBJ_INDEX) {
+            palette[i | PRIORITY] = rgb1555;
+        }
+    }
+    palette_dirty = 0;
+}
+
 
 void gb_present_frame(void)
 {
+    if (frame_active && palette_dirty) {
+        refresh_palette();
+    }
     if (frame_active && !gb_video_dirty && !gb_oam_dirty) {
         return;
     }
@@ -331,10 +341,18 @@ void gb_present_frame(void)
     if (!frame_active) {
         saved_control = lcd_Control;
         saved_base = lcd_UpBase;
-        frame_active = true;
-        lcd_Control = (saved_control & ~(LCD_PIXEL_FORMAT | LCD_PIXEL_ORDER)) | LCD_RGB565;
+        volatile uint16_t *palette = lcd_Palette;
+        for (unsigned i = 0; i < COLOR_COUNT; ++i) {
+            saved_colors[i] = palette[i];
+        }
+        for (unsigned i = 0; i < OBJ_INDEX; ++i) {
+            saved_priority_colors[i] = palette[i | PRIORITY];
+        }
+        refresh_palette();
+        memset(lcd_Ram, BLACK_INDEX, LCD_WIDTH * LCD_HEIGHT);
         lcd_UpBase = (uint24_t)lcd_Ram;
-        memset(lcd_Ram, 0, LCD_SIZE);
+        lcd_Control = (saved_control & ~(LCD_PIXEL_FORMAT | LCD_PIXEL_ORDER)) | LCD_INDEXED8;
+        frame_active = true;
     }
 
     uint8_t object_start = GB_SCREEN_HEIGHT, object_end = 0;
@@ -363,9 +381,11 @@ void gb_present_frame(void)
         end = GB_SCREEN_HEIGHT;
     }
     if (first < end) {
-        uint16_t *line = (uint16_t *)lcd_Ram + ((LCD_HEIGHT - GB_SCREEN_HEIGHT) / 2 + first) * LCD_WIDTH
+        uint8_t *line = (uint8_t *)lcd_Ram + ((LCD_HEIGHT - GB_SCREEN_HEIGHT) / 2 + first) * LCD_WIDTH
                                           + (LCD_WIDTH - GB_SCREEN_WIDTH) / 2;
-        prepare_frame();
+        if (gb_lcdc & OBJ_ENABLE) {
+            prepare_objects();
+        }
         for (uint8_t y = first; y < end; ++y) {
             render_scanline(y, line);
             line += LCD_WIDTH;
@@ -380,6 +400,13 @@ void gb_end_frame(void)
     if (frame_active) {
         lcd_UpBase = saved_base;
         lcd_Control = saved_control;
+        volatile uint16_t *palette = lcd_Palette;
+        for (unsigned i = 0; i < COLOR_COUNT; ++i) {
+            palette[i] = saved_colors[i];
+        }
+        for (unsigned i = 0; i < OBJ_INDEX; ++i) {
+            palette[i | PRIORITY] = saved_priority_colors[i];
+        }
         frame_active = false;
     }
 }

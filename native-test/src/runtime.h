@@ -104,6 +104,8 @@ uint8_t gb_store_hl(void);
 uint8_t gb_set_hl_bit(uint8_t bit);
 uint8_t gb_store_a(uint24_t address);
 uint24_t gb_read_byte(uint24_t address);
+/* Resolve a source that fits entirely within one retained ROM span or WRAM bank. */
+const uint8_t *gb_read_contiguous(uint16_t address, unsigned length);
 uint8_t gb_write_byte(uint24_t address, uint8_t value);
 uint8_t gb_push_word(uint24_t value);
 uint24_t gb_pop_word(void);
