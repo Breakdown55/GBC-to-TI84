@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -13,6 +14,8 @@ from rom import compile_rom
 
 PROJECT = Path(__file__).resolve().parent
 EXECUTABLE = ".exe" if os.name == "nt" else ""
+LOAD_ADDRESS = 0xd1a87f
+DISPLAY_RAM = 0xd40000
 
 
 def toolchain_path(explicit):
@@ -23,6 +26,50 @@ def toolchain_path(explicit):
         raise ValueError("set --cedev to the installed CEdev directory or use a CEdev shell")
     prefix = subprocess.check_output([config, "--prefix"], text=True).strip()
     return Path(prefix).resolve()
+
+
+def guard_compressed_program(run, work):
+    path = work / "program.8xp"
+    program = bytearray(path.read_bytes())
+    payload_start = 0x4a
+    if (len(program) < payload_start + 2 or program[:8] != b"**TI83F*"
+            or struct.unpack_from("<H", program, 0x37)[0] != 13
+            or program[0x3b] not in (5, 6)):
+        raise ValueError("expected one TI program variable")
+    payload = bytearray(program[payload_start:-2])
+    sizes = ((0x35, len(payload) + 19), (0x39, len(payload) + 2),
+             (0x46, len(payload) + 2), (0x48, len(payload)))
+    if any(struct.unpack_from("<H", program, offset)[0] != size for offset, size in sizes):
+        raise ValueError("invalid TI program variable lengths")
+    if payload[:4] != b"\xef\x7b\x00\x21" or len(payload) < 7:
+        raise ValueError("unrecognized compressed CE launcher")
+    stub_address = int.from_bytes(payload[4:7], "little")
+    stub_offset = stub_address - LOAD_ADDRESS
+    if (not 7 <= stub_offset <= len(payload) - 9 or payload[stub_offset] != 0x21
+            or payload[stub_offset + 4:stub_offset + 9] != b"\xe5\xcd\x2c\x07\x02"):
+        raise ValueError("unrecognized compressed CE launcher memory check")
+    expansion = int.from_bytes(payload[stub_offset + 1:stub_offset + 4], "little")
+    guard_address = LOAD_ADDRESS + len(payload)
+    run("binutils/bin/z80-none-elf-as", "-march=ez80+full", PROJECT / "archive_guard.S",
+        "-o", "guard.o")
+    run("binutils/bin/z80-none-elf-ld", "-Ttext", f"0x{guard_address:x}", "--entry=guard",
+        f"--defsym=guard_source=0x{stub_address:x}", f"--defsym=guard_resume=0x{LOAD_ADDRESS + 7:x}",
+        f"--defsym=guard_required={expansion + 256}", "guard.o", "-o", "guard.elf")
+    run("binutils/bin/z80-none-elf-objcopy", "-O", "binary", "guard.elf", "guard.bin")
+    payload[3:7] = b"\xc3" + guard_address.to_bytes(3, "little")
+    payload.extend((work / "guard.bin").read_bytes())
+    payload.extend(program[0x3b:0x44])
+    if len(payload) > 0xffff - 19:
+        raise ValueError("guarded program exceeds the TI variable file limit")
+    if LOAD_ADDRESS + len(payload) + expansion > DISPLAY_RAM:
+        raise ValueError("the compressed launcher would expand into calculator display RAM")
+    program[0x45] = 0x80
+    for offset, size in ((0x35, len(payload) + 19), (0x39, len(payload) + 2),
+                         (0x46, len(payload) + 2), (0x48, len(payload))):
+        struct.pack_into("<H", program, offset, size)
+    program = program[:payload_start] + payload
+    program.extend((sum(program[0x37:]) & 0xffff).to_bytes(2, "little"))
+    path.write_bytes(program)
 
 
 def build(ce, work, name, show_frame=False):
@@ -70,7 +117,7 @@ def build(ce, work, name, show_frame=False):
     run(clang, "-I.", "-E", "-P", lib / "crt/crt0.S", "-o", "crt0.s")
     run(assembler, "-I.", "-march=ez80+full", "crt0.s", "-o", "crt0.o")
     run(linker, "-static", "--entry=__start", "--no-warn-rwx-segments", "--gc-sections",
-        "--omagic", "--defsym=LOAD_ADDR=0xD1A87F", "--defsym=BSSHEAP_LOW=0xD052C6",
+        "--omagic", f"--defsym=LOAD_ADDR=0x{LOAD_ADDRESS:x}", "--defsym=BSSHEAP_LOW=0xD052C6",
         "--defsym=BSSHEAP_HIGH=0xD13FD8", "--defsym=STACK_HIGH=0xD1A87E", "--defsym=__TICE__=1",
         "-T", ce / "meta/linker_script.ld", "-Map=program.map", "program.o", "crt0.o",
         "--start-group", lib / "libc/allocator_standard.a", *core_libs,
@@ -79,7 +126,7 @@ def build(ce, work, name, show_frame=False):
     load_end = re.search(r"(?m)^\s*(0x[0-9a-fA-F]+)\s+___data_high\s*=", mapping)
     if load_end is None:
         raise ValueError("could not determine the linked program's end address")
-    if int(load_end[1], 16) > 0xd40000:
+    if int(load_end[1], 16) > DISPLAY_RAM:
         raise ValueError("the linked program would overlap calculator display RAM")
     convert_args = ("-u", "-n", name, "-j", "elf", "-i", "program.obj", "-o", "program.8xp")
     run("bin/convbin", "-k", "8xp", *convert_args)
@@ -88,9 +135,11 @@ def build(ce, work, name, show_frame=False):
         # The split launcher depends on companion AppVars. Try a single compressed program.
         for part in parts:
             part.unlink()
-        run("bin/convbin", "-k", "8xp-compressed", "-e", "zx7", *convert_args)
+        run("bin/convbin", "-k", "8xp-compressed", "-e", "zx7", "-r", *convert_args)
         if any(work.glob("program.8xp.*.8xv")):
             raise ValueError("generated program exceeds the single-file TI program limit")
+        guard_compressed_program(run, work)
+    return bool(parts)
 
 
 def parse_entry(text):
@@ -153,12 +202,13 @@ def main():
             work = Path(directory)
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
-            build(ce, work, args.name, args.frame or bool(preview_frames))
+            archived = build(ce, work, args.name, args.frame or bool(preview_frames))
             os.replace(work / "program.8xp", output)
             os.replace(work / "program.map", output.with_suffix(".map"))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"{error}\n")
     print(output)
+    print(f"Transfer destination: {'Archive' if archived else 'RAM'}")
 
 
 if __name__ == "__main__":

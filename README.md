@@ -10,7 +10,9 @@ Use Python 3 and the [CE C/C++ toolchain](https://ce-programming.github.io/toolc
 python native-test/recompile.py input.gbc output.8xp
 ```
 
-Outside a toolchain shell, pass `--cedev` with the installed CEdev directory. Send the resulting file to RAM and run `GBCRUN` on an OS setup that supports native programs.
+Outside a toolchain shell, pass `--cedev` with the installed CEdev directory. Send the resulting file to the transfer destination printed by the builder and run `GBCRUN` on an OS setup that supports native programs.
+
+Large builds use a compressed launcher and must be sent to **Archive**. The launcher checks the program's archive status and available RAM before unpacking.
 
 The prototype supports a subset of Game Boy instructions, ROM-only and MBC5 cartridges, and Color-mode video RAM and work RAM banking. MBC5 save RAM starts erased on each run and uses a bounded in-memory store.
 
