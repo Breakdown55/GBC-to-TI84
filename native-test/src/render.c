@@ -375,6 +375,43 @@ static uint8_t previous_object_start, previous_object_end;
 static uint16_t saved_colors[COLOR_COUNT], saved_priority_colors[OBJ_INDEX];
 static uint8_t background_state[6];
 
+enum { BACKGROUND_TILE_SLOTS = 16 };
+static uint16_t background_tile_keys[BACKGROUND_TILE_SLOTS];
+#define background_tile_cache (graphics_cache + CACHE_BYTES)
+_Static_assert(CACHE_BYTES + BACKGROUND_TILE_SLOTS * TILE_PIXELS <= LCD_SIZE / 2,
+               "background tile cache exceeds spare LCD RAM");
+
+/* A rebuild reads stable VRAM. Cache palette and flip variants for that
+ * rebuild, so rectangles sharing a tile can copy its rows directly. */
+static const uint8_t *background_tile(unsigned bank, unsigned tile, uint8_t attributes)
+{
+    uint8_t variant = attributes & (PRIORITY | X_FLIP | 7);
+    if (!variant) {
+        return decoded_tile(bank, tile);
+    }
+    unsigned slot = (tile ^ (tile >> 4) ^ variant ^ (variant >> 4)) & (BACKGROUND_TILE_SLOTS - 1);
+    uint16_t key = (tile + bank * 384) | ((uint16_t)(variant & 7) << 10)
+                 | ((uint16_t)(variant & X_FLIP) << 8) | ((uint16_t)(variant & PRIORITY) << 7);
+    uint8_t *pixels = background_tile_cache + slot * TILE_PIXELS;
+    if (background_tile_keys[slot] != key) {
+        const uint8_t *source = decoded_tile(bank, tile);
+        uint8_t base = ((variant & 7) << 2) | (variant & PRIORITY);
+        for (unsigned row = 0; row < TILE_PIXELS; row += TILE_WIDTH) {
+            if (variant & X_FLIP) {
+                for (unsigned column = 0; column < TILE_WIDTH; ++column) {
+                    pixels[row + column] = base | source[row + TILE_WIDTH - 1 - column];
+                }
+            } else {
+                for (unsigned column = 0; column < TILE_WIDTH; ++column) {
+                    pixels[row + column] = base | source[row + column];
+                }
+            }
+        }
+        background_tile_keys[slot] = key;
+    }
+    return pixels;
+}
+
 /* Resolve map entries once per visible tile rectangle, rather than once per
  * scanline. Partial tiles at scroll/window edges still use the same pixels. */
 static void background_region(unsigned x, unsigned y, unsigned width, unsigned height,
@@ -396,11 +433,11 @@ static void background_region(unsigned x, unsigned y, unsigned width, unsigned h
             if (columns > remaining) columns = remaining;
             if (!incremental_background || tile_changed[bank * 384 + tile] || map_changed[cell - 0x1800]) {
                 uint8_t *destination = background_pixels + y * GB_SCREEN_WIDTH + destination_x;
+                const uint8_t *pixels = background_tile(bank, tile, attributes);
                 for (unsigned row = 0; row < rows; ++row) {
                     unsigned tile_y = (source_y & 7) + row;
                     if (attributes & Y_FLIP) tile_y = 7 - tile_y;
-                    const TileRow *decoded = background_row(bank, tile * 16 + tile_y * 2, attributes);
-                    memcpy(destination, decoded->pixels + (sx & 7), columns);
+                    memcpy(destination, pixels + tile_y * TILE_WIDTH + (sx & 7), columns);
                     destination += GB_SCREEN_WIDTH;
                 }
             }
@@ -416,6 +453,7 @@ static void rebuild_background(void)
         memset(background_pixels, WHITE_INDEX, BACKGROUND_BYTES);
         return;
     }
+    memset(background_tile_keys, 0xff, sizeof background_tile_keys);
     int window_x = (int)gb_wx - 7;
     bool window = (gb_lcdc & WINDOW_ENABLE) && gb_wy < GB_SCREEN_HEIGHT && window_x < GB_SCREEN_WIDTH;
     unsigned top = window ? gb_wy : GB_SCREEN_HEIGHT;

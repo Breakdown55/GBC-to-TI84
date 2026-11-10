@@ -34,7 +34,7 @@ For continuous HALT-driven execution, use `--live --vblank-run`. It has no runti
 
 Renderer optimizations are automatic for every cartridge the compiler supports. The calculator displays 8-bit palette indices, so palette changes can update colors without redrawing pixels. A decoded-tile cache covers both video RAM banks, and a retained background layer avoids rebuilding the background beneath moving sprites. Background updates resolve map entries once per tile rectangle. CPU stores and DMA transfers invalidate the affected tiles and map cells. Changes to scrolling or display layout rebuild the background. Sprite composition preserves transparency, priority, flips, and the ten-sprites-per-scanline limit.
 
-These caches occupy 75,776 bytes in the unused half of LCD memory while the indexed display is active. They do not consume that amount of the program's code/data RAM. This remains a frame-based renderer; caching does not add scanline-accurate mid-frame video effects.
+The graphics buffers occupy the unused 76,800-byte half of LCD memory while the indexed display is active. During a background rebuild, the renderer also reuses tiles with their palette, priority, and horizontal flip already applied. Video remains frame-based, so mid-frame effects have limited accuracy.
 
 The compiler also packs nearby cartridge data ranges together and shares repeated native instruction sequences in VBlank preview builds. It makes those decisions from the input ROM and generated code.
 
