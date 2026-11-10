@@ -39,6 +39,40 @@ STATE_MOVE = re.compile(
 WORD_STEP = re.compile(r"(?:inc|dec)\.s (bc|de|hl)")
 A_ARITHMETIC = re.compile(r"(?:add|adc|sub|sbc|and|xor|or) a, (?:[abcdehl]|0x[0-9a-f]+)")
 A_COMPARE = re.compile(r"cp a, (?:[abcdehl]|0x[0-9a-f]+)")
+FLAG_BRANCH = re.compile(r"(jp|jr) (z|nz), (\S+)")
+
+
+def native_entries(assembly, dispatch_entries):
+    entries = set(dispatch_entries)
+    for line in assembly:
+        if line.startswith(("    jp ", "    jr ", "    call ")):
+            entries.update(GUEST_LABEL.findall(line))
+    return entries
+
+
+def forward_native_flags(assembly, entries):
+    """Use live host Z/C after the flag conversion helper when no entry intervenes."""
+    live = False
+    for index, line in enumerate(assembly):
+        operation = line.strip()
+        if not operation or operation.startswith((".assume ", ".section ", ".global ")):
+            continue
+        if operation.endswith(":") and GUEST_LABEL.fullmatch(operation[:-1]) and operation[:-1] not in entries:
+            continue
+        if operation == "call _gb_native_flags":
+            live = True
+        elif live and operation == "ld a, (_gb_f)" and index + 2 < len(assembly):
+            test = assembly[index + 1].strip()
+            branch = FLAG_BRANCH.fullmatch(assembly[index + 2].strip())
+            if test in ("bit 4, a", "bit 7, a") and branch:
+                jump, condition, target = branch.groups()
+                native = ("c" if condition == "nz" else "nc") if test == "bit 4, a" else (
+                    "z" if condition == "nz" else "nz"
+                )
+                assembly[index] = assembly[index + 1] = ""
+                assembly[index + 2] = f"    {jump} {native}, {target}"
+        elif not operation.startswith("ld ") or operation.startswith("ld (_gb_f),"):
+            live = False
 
 
 def reuse_native_registers(assembly, dispatch_entries):
@@ -48,10 +82,7 @@ def reuse_native_registers(assembly, dispatch_entries):
     or unknown helper call. A write may be removed only when a later write
     supersedes it without an intervening read from the slot.
     """
-    entries = set(dispatch_entries)
-    for line in assembly:
-        if line.startswith(("    jp ", "    jr ", "    call ")):
-            entries.update(GUEST_LABEL.findall(line))
+    entries = native_entries(assembly, dispatch_entries)
 
     resident = set()
     stores = {}

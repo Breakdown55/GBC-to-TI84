@@ -5,6 +5,7 @@ import sys
 import unittest
 
 from rom import BANK_SIZE, CHECKPOINT, Cartridge, compile_rom
+from translate import forward_native_flags, native_entries
 
 
 def cartridge_image():
@@ -226,6 +227,34 @@ class RomTest(unittest.TestCase):
         timed, _ = compile_rom(data, timing=True, stop_at=(0, 0x111))
         self.assertNotIn("call _gb_copy_hl_de", timed)
 
+    def test_unrolled_fill_keeps_original_backedge(self):
+        data = cartridge_image()
+        code = bytes.fromhex("21 00 c0 06 02 3e a5 22 22 22 22 05 20 f9 76")
+        data[0x100:0x100 + len(code)] = code
+        assembly, _ = compile_rom(data)
+        self.assertIn("ld hl, 7\n    push hl\n    call _gb_fill_hl", assembly)
+        self.assertIn("jp z, .Lbulk_slow_000_0107", assembly)
+
+    def test_ram_counter_wait_validates_branch_displacement(self):
+        data = cartridge_image()
+        data[0x100:0x103] = bytes.fromhex("c3 86 ff")
+        data[0x200:0x204] = bytes.fromhex("3d 20 fd 76")
+        assembly, _ = compile_rom(data, ram_code=[(0xff86, 0, 0x200, 4)])
+        self.assertIn("ld a, (_gb_hram+8)\n    cp a, 0xfd\n    jr nz, .Lcounter_slow", assembly)
+        self.assertIn("or a, 0xc0\n    ld (_gb_f), a\n    xor a, a", assembly)
+        timed, _ = compile_rom(data, timing=True, stop_at=(0, 0xff89),
+                               ram_code=[(0xff86, 0, 0x200, 4)])
+        self.assertNotIn(".Lcounter_slow", timed)
+
+    def test_native_flags_do_not_cross_a_dispatch_entry(self):
+        lines = ["    call _gb_native_flags", "_gb_000_0102:",
+                 "    ld a, (_gb_f)", "    bit 7, a", "    jp nz, .Ltaken"]
+        optimized = lines.copy()
+        forward_native_flags(optimized, native_entries(optimized, []))
+        self.assertEqual(optimized[-3:], ["", "", "    jp z, .Ltaken"])
+        forward_native_flags(lines, native_entries(lines, ["_gb_000_0102"]))
+        self.assertEqual(lines[-2:], ["    bit 7, a", "    jp nz, .Ltaken"])
+
     def test_unknown_fill_counter_has_only_256_possible_lengths(self):
         from rom import State
         data = cartridge_image()
@@ -334,6 +363,8 @@ class RomTest(unittest.TestCase):
         timed, _ = compile_rom(data, timing=True, stop_at=(0, 0x106))
         self.assertIn("ld hl, 0x0090\n    push hl\n    call _gb_timing_skip_poll", timed)
         self.assertIn("call _gb_boundary", timed)
+        self.assertIn("ld hl, 0x0102\n    ld de, 8\n    call _gb_pure_boundary", timed)
+        self.assertIn("ld hl, 0x0104\n    ld de, 8\n    call _gb_boundary", timed)
         untimed, _ = compile_rom(data)
         self.assertNotIn("call _gb_timing_skip_poll", untimed)
 

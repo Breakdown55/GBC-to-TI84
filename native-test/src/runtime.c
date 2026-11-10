@@ -45,10 +45,15 @@ volatile uint8_t gb_a;
 volatile uint8_t gb_f;
 volatile uint8_t gb_ime;
 uint8_t gb_vram[2][GB_VRAM_SIZE];
+uint8_t *gb_vram_page = gb_vram[0];
 uint8_t gb_wram[GB_WRAM_SIZE];
 uint8_t gb_wram_banks[7][GB_WRAM_SIZE];
 /* The two 4 KiB WRAM pages are also visible through the echo window. */
 uint8_t *gb_wram_pages[2] = {gb_wram, gb_wram_banks[0]};
+/* Native reads can reuse the most recent contiguous ROM span. */
+struct {
+    uint24_t start, length, bias;
+} gb_rom_read_cache;
 uint8_t gb_hram[GB_HRAM_SIZE];
 uint8_t gb_lcdc;
 uint8_t gb_ly;
@@ -461,6 +466,7 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
     case 0x4f:
         if (gb_cgb) {
             gb_vbk = value & 1;
+            gb_vram_page = gb_vram[gb_vbk];
         }
         break;
     case 0x51:
@@ -543,13 +549,21 @@ uint8_t gb_watch_ram(uint16_t address)
     return byte ? *byte : 0xff;
 }
 
+static const GbRomSpan *cache_rom_span(const GbRomSpan *span)
+{
+    gb_rom_read_cache.start = span->address;
+    gb_rom_read_cache.bias = (uintptr_t)(gb_rom_payload + span->offset) - span->address;
+    gb_rom_read_cache.length = span->length;
+    return span;
+}
+
 static const GbRomSpan *find_rom_span(uint16_t address)
 {
     static const GbRomSpan *last_span;
     uint16_t bank = address < 0x4000 ? 0 : gb_rom_bank;
     if (last_span && last_span->bank == bank &&
         (uint16_t)(address - last_span->address) < last_span->length) {
-        return last_span;
+        return gb_rom_read_cache.length ? last_span : cache_rom_span(last_span);
     }
     unsigned first = 0, last = gb_rom_data_count;
     while (first < last) {
@@ -560,7 +574,7 @@ static const GbRomSpan *find_rom_span(uint16_t address)
         } else if (span->bank > bank || address < span->address) {
             last = middle;
         } else {
-            return last_span = span;
+            return last_span = cache_rom_span(span);
         }
     }
     return 0;
@@ -712,7 +726,11 @@ static uint8_t write_memory(uint24_t address, uint8_t value)
         } else {
             bank = (bank & 0xff) | ((uint16_t)(value & 1) << 8);
         }
-        gb_rom_bank = bank & gb_rom_bank_mask;
+        bank &= gb_rom_bank_mask;
+        if (bank != gb_rom_bank) {
+            gb_rom_bank = bank;
+            gb_rom_read_cache.length = 0;
+        }
     } else if (gb_mbc5 && address < 0x6000) {
         sram_bank = value & 0x0f;
     } else {
@@ -807,15 +825,17 @@ uint8_t gb_store_hld(void)
     return 1;
 }
 
-/* Fuse LD [HL+],A / DEC B-or-C / JR NZ for untimed translation only.
+/* Fuse counted LD [HL+],A runs for untimed translation only.
  * Reject MMIO, cartridge RAM, and crossings before touching guest state. */
-uint8_t gb_fill_hl(uint8_t use_b)
+uint8_t gb_fill_hl(uint8_t layout)
 {
     if (gb_timing_enabled) return 0;
+    bool use_b = layout & 1;
+    unsigned width = (layout >> 1) + 1;
     uint16_t original = (uint16_t)gb_hl;
     unsigned address = original;
     unsigned count = use_b ? (gb_bc >> 8) & 255 : gb_bc & 255;
-    if (!count) count = 256;
+    count = (count ? count : 256) * width;
     if (address >= 0xe000 && address < 0xfe00) {
         if (count > 0xfe00 - address) return 0;
         address -= 0x2000;
@@ -833,7 +853,9 @@ uint8_t gb_fill_hl(uint8_t use_b)
     }
     uint8_t value = gb_a;
     unsigned changed = 0;
-    while (changed < count && bytes[changed] == value) ++changed;
+    if (video) {
+        while (changed < count && bytes[changed] == value) ++changed;
+    }
     if (changed < count) {
         memset(bytes, value, count);
         if (video) gb_video_invalidate(gb_cgb ? gb_vbk : 0, address - 0x8000, count);

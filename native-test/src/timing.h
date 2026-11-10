@@ -20,6 +20,7 @@ void gb_di(void);
 
 /* Entry points for the native dispatch stubs. */
 uint24_t gb_timing_boundary(uint24_t pc, uint24_t cycles);
+uint24_t gb_timing_pure_boundary(uint24_t pc, uint24_t cycles);
 uint24_t gb_timing_halt(uint24_t resume);
 void gb_timing_skip_poll(uint24_t rule);
 void gb_timing_enable_ime(void);

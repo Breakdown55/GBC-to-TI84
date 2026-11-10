@@ -20,7 +20,8 @@ void (*gb_host_frame)(void);
 uint8_t gb_host_quit;
 
 /* The native boundary charges the last instruction before starting another. */
-static uint8_t staged_cycles;
+uint8_t gb_timing_staged;
+uint8_t gb_timing_budget;
 static uint8_t staged_double_speed;
 static uint8_t ime_delay;
 static uint8_t timing_fault;
@@ -187,7 +188,8 @@ void gb_timing_stall(uint16_t dots)
 
 void gb_timing_init(void)
 {
-    staged_cycles = 0;
+    gb_timing_staged = 0;
+    gb_timing_budget = 0;
     staged_double_speed = 0;
     stalled_dots = 0;
     timing_fault = 0;
@@ -310,8 +312,9 @@ void gb_timing_enable_ime(void)
 
 uint8_t gb_timing_flush(void)
 {
-    uint8_t cycles = staged_cycles + gb_timing_extra;
-    staged_cycles = 0;
+    uint8_t cycles = gb_timing_staged + gb_timing_extra;
+    gb_timing_staged = 0;
+    gb_timing_budget = 0;
     gb_timing_extra = 0;
     if (cycles) {
         advance(cycles, staged_double_speed, 0);
@@ -336,6 +339,22 @@ static uint8_t pending_interrupts(void)
     return gb_if & gb_ie & IRQ_MASK;
 }
 
+/* Stop before any LCD transition or timer event that can interrupt execution. */
+static unsigned cycles_until_event(uint8_t fast)
+{
+    unsigned limit = (gb_lcdc & LCD_ENABLED) ? (next_lcd_dot() - dot) << fast : 241;
+    if (gb_ime && (gb_ie & IRQ_TIMER)) {
+        if (reload_cycles) return reload_cycles;
+        if (gb_tac & 4) {
+            unsigned period = timer_period();
+            uint24_t overflow = period - (divider & (period - 1))
+                               + (uint24_t)(255 - tima) * period;
+            if (overflow < limit) limit = overflow;
+        }
+    }
+    return limit;
+}
+
 /* Skip complete 32-cycle LDH/compare/JR iterations before the next event.
  * The ordinary instruction boundaries still handle the transition itself. */
 void gb_timing_skip_poll(uint24_t rule)
@@ -344,16 +363,7 @@ void gb_timing_skip_poll(uint24_t rule)
         !(gb_lcdc & LCD_ENABLED) || (gb_ime && pending_interrupts())) return;
 
     uint8_t fast = double_speed();
-    unsigned limit = (next_lcd_dot() - dot) << fast;
-    if (gb_ime && (gb_ie & IRQ_TIMER)) {
-        if (reload_cycles) return;
-        if (gb_tac & 4) {
-            unsigned period = timer_period();
-            uint24_t overflow = period - (divider & (period - 1))
-                               + (uint24_t)(255 - tima) * period;
-            if (overflow < limit) limit = overflow;
-        }
-    }
+    unsigned limit = cycles_until_event(fast);
     if (limit <= 32) return;
 
     uint8_t argument = rule;
@@ -408,9 +418,20 @@ uint24_t gb_timing_boundary(uint24_t pc, uint24_t cycles)
     if (gb_ime && pending) {
         return service_interrupt(pc, pending);
     }
-    staged_cycles = cycles;
+    gb_timing_staged = cycles;
     staged_double_speed = double_speed();
     return DISPATCH_NONE;
+}
+
+uint24_t gb_timing_pure_boundary(uint24_t pc, uint24_t cycles)
+{
+    uint24_t dispatch = gb_timing_boundary(pc, cycles);
+    if (!dispatch && !ime_delay) {
+        unsigned limit = cycles_until_event(staged_double_speed);
+        if (limit > 241) limit = 241;
+        if (limit > cycles) gb_timing_budget = limit - cycles - 1;
+    }
+    return dispatch;
 }
 
 static uint8_t halt_step(uint8_t sources, uint8_t fast)

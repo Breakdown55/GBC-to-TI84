@@ -4,7 +4,11 @@
     .global _gb_fast_\name
 _gb_fast_\name:
     ld hl, (_gb_hl)
+    .if \store
     call .Lplain_ram
+    .else
+    call .Lread_pointer
+    .endif
     jp c, _gb_\fallback
     .if \store
     ld a, (_gb_a)
@@ -16,13 +20,11 @@ _gb_fast_\name:
     .if \step
     ld hl, (_gb_hl)
     .if \step > 0
-    inc hl
+    inc.s hl
     .else
-    dec hl
+    dec.s hl
     .endif
     ld (_gb_hl), hl
-    xor a, a
-    ld (_gb_hl+2), a
     .endif
     ld a, 1
     ret
@@ -37,7 +39,7 @@ _gb_fast_\name:
 /* The translated code passes the guest address in HL and the store value in A. */
     .global _gb_read_indirect
 _gb_read_indirect:
-    call .Lplain_ram
+    call .Lread_pointer
     jr c, .Lread_bus
     ld a, (hl)
     ret
@@ -76,6 +78,7 @@ _gb_write_indirect:
     ld a, h
     cp a, 0xc0
     ret c
+.Lread_work_ram:
     cp a, 0xfe
     jr nc, .Lhigh_ram
     and a, 0x1f
@@ -109,6 +112,35 @@ _gb_write_indirect:
     ret
 .Lnot_plain_ram:
     scf
+    ret
+
+/* VRAM reads have no write side effects. The ROM cache contains a span
+ * resolved by the checked bus, and is invalidated on a ROM bank change. */
+.Lread_pointer:
+    ld a, h
+    cp a, 0xc0
+    jr nc, .Lread_work_ram
+    cp a, 0x80
+    jr c, .Lread_rom_cached
+    cp a, 0xa0
+    jr nc, .Lnot_plain_ram
+    and a, 0x1f
+    ld h, a
+    ld de, (_gb_vram_page)
+    add hl, de
+    ret
+.Lread_rom_cached:
+    push hl
+    ld de, (_gb_rom_read_cache)
+    or a, a
+    sbc hl, de
+    ld de, (_gb_rom_read_cache+3)
+    or a, a
+    sbc hl, de
+    pop hl
+    jr nc, .Lnot_plain_ram
+    ld de, (_gb_rom_read_cache+6)
+    add hl, de
     ret
 
     .section .text.gb_native_flags
@@ -424,13 +456,31 @@ _gb_fast_pop:
 
     .section .text.gb_timing_dispatch
     .global _gb_boundary
+    .global _gb_pure_boundary
     .global _gb_reti
     .global _gb_timed_halt
+
+_gb_pure_boundary:
+    ld a, (_gb_timing_budget)
+    sub a, e
+    jr c, .Lpure_slow
+    ld (_gb_timing_budget), a
+    ld a, (_gb_timing_staged)
+    add a, e
+    ld (_gb_timing_staged), a
+    ld (_gb_pc), hl
+    ret
+.Lpure_slow:
+    push de
+    push hl
+    call _gb_timing_pure_boundary
+    jr .Lboundary_result
 
 _gb_boundary:
     push de             ; Staged T-cycles, then guest PC.
     push hl
     call _gb_timing_boundary
+.Lboundary_result:
     pop de
     pop de
     ld a, l             ; Zero, fault (1), or a guest IRQ vector.

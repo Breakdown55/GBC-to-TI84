@@ -56,6 +56,14 @@ int main(void)
     gb_hl=0x8000;gb_bc=1;gb_a=gb_vram[1][0];invalidations=0;
     assert(gb_fill_hl(0)&&!invalidations);
 
+    gb_hl = 0x8ffc; gb_bc = 0x0235; gb_a = 0x79; gb_f = 0;
+    assert(gb_fill_hl(7));
+    assert(!memcmp(&gb_vram[1][0xffc], "yyyyyyyy", 8));
+    assert(gb_hl == 0x9004 && gb_bc == 0x35 && gb_f == 0xc0);
+    assert(invalidations == 1 && offset_seen == 0xffc && length_seen == 8);
+    gb_hl = 0xcff9; gb_bc = 2;
+    assert(!gb_fill_hl(6) && gb_hl == 0xcff9 && gb_bc == 2);
+
     for (unsigned i = 0; i < 32; ++i) gb_wram_banks[6][i] = i + 1;
     gb_hl = 0xd000; gb_de = 0x8ff0; gb_bc = 0x5302; gb_f = 0x30;
     invalidations = 0;

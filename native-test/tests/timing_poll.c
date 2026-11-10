@@ -7,6 +7,7 @@ volatile uint8_t gb_a, gb_f, gb_ime;
 volatile uint24_t gb_pc;
 uint8_t gb_key1, gb_tac, gb_tma, gb_lcdc, gb_ly, gb_lyc, gb_stat, gb_if, gb_ie;
 uint8_t gb_video_dirty, gb_cgb;
+extern uint8_t gb_timing_staged, gb_timing_budget;
 
 void gb_vram_dma_reset(void) {}
 uint8_t gb_vram_dma_hblank(void) { return GB_VRAM_DMA_IDLE; }
@@ -58,4 +59,27 @@ int main(void)
     gb_ei();
     gb_timing_skip_poll(0x0090);
     assert(gb_timing_read(0x05) == 0 && gb_a == 0xa5);
+
+    setup(0);
+    assert(!gb_timing_pure_boundary(0x100, 8));
+    assert(gb_pc == 0x100 && gb_timing_staged == 8 && gb_timing_budget == 71);
+    gb_timing_staged += 68; /* Consecutive native boundaries consume the budget. */
+    assert(!gb_timing_boundary(0x110, 4));
+    assert(gb_timing_read(0x05) == 4 && gb_timing_budget == 0);
+    assert(gb_timing_flush() && (gb_timing_read(0x41) & 3) == 3);
+
+    setup(0x80);
+    assert(!gb_timing_pure_boundary(0x100, 8) && gb_timing_budget == 151);
+    setup(0);
+    gb_timing_enable_ime();
+    gb_ie = 4;
+    gb_timing_write(0x05, 0xff);
+    assert(!gb_timing_pure_boundary(0x100, 8) && gb_timing_budget == 7);
+    setup(0);
+    assert(!gb_timing_boundary(0x100, 4));
+    gb_ei();
+    assert(!gb_timing_pure_boundary(0x101, 4));
+    assert(!gb_ime && gb_timing_budget == 0);
+    assert(!gb_timing_pure_boundary(0x102, 4));
+    assert(gb_ime && gb_timing_budget == 67);
 }

@@ -99,7 +99,7 @@ uint8_t gb_load_a(uint24_t address);
 uint8_t gb_store_hli(void);
 uint8_t gb_store_hld(void);
 uint8_t gb_store_hl(void);
-uint8_t gb_fill_hl(uint8_t use_b);
+uint8_t gb_fill_hl(uint8_t layout);
 uint8_t gb_copy_hl_de(uint8_t layout);
 uint8_t gb_set_hl_bit(uint8_t bit);
 uint8_t gb_store_a(uint24_t address);

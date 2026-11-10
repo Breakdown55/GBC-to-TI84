@@ -24,6 +24,7 @@ static uint8_t graphics_cache[CACHE_BYTES];
 #define map_changed (tile_changed + TILE_COUNT)
 static bool background_valid;
 static bool incremental_background;
+static uint8_t background_start, background_end;
 static bool background_vram_dirty;
 
 void gb_video_invalidate(unsigned bank, unsigned offset, unsigned length)
@@ -471,6 +472,7 @@ static void background_region(unsigned x, unsigned y, unsigned width, unsigned h
         unsigned remaining = width, destination_x = x;
         uint8_t sx = source_x;
         unsigned map_row = map + (source_y >> 3) * 32;
+        bool changed = false;
         while (remaining) {
             unsigned cell = map_row + (sx >> 3);
             uint8_t number = gb_vram[0][cell];
@@ -480,6 +482,7 @@ static void background_region(unsigned x, unsigned y, unsigned width, unsigned h
             unsigned columns = 8 - (sx & 7);
             if (columns > remaining) columns = remaining;
             if (!incremental_background || tile_changed[bank * 384 + tile] || map_changed[cell - 0x1800]) {
+                changed = true;
                 uint8_t *destination = background_pixels + y * GB_SCREEN_WIDTH + destination_x;
                 const uint8_t *pixels = background_tile(bank, tile, attributes);
                 for (unsigned row = 0; row < rows; ++row) {
@@ -490,6 +493,10 @@ static void background_region(unsigned x, unsigned y, unsigned width, unsigned h
                 }
             }
             destination_x += columns; sx += columns; remaining -= columns;
+        }
+        if (changed && incremental_background) {
+            if (y < background_start) background_start = y;
+            if (y + rows > background_end) background_end = y + rows;
         }
         y += rows; source_y += rows; height -= rows;
     }
@@ -585,7 +592,6 @@ void gb_present_frame(void)
     if (frame_active && !gb_video_dirty && !gb_oam_dirty) {
         return;
     }
-    bool full_redraw = !frame_active || gb_video_dirty;
     if (!frame_active) {
         /* TI-OS or another screen owner may have reused the entire LCD RAM. */
         memset(tile_valid, 0, TILE_COUNT);
@@ -606,13 +612,20 @@ void gb_present_frame(void)
         frame_active = true;
     }
 
-    if (full_redraw || !background_valid) {
+    background_start = GB_SCREEN_HEIGHT;
+    background_end = 0;
+    if (gb_video_dirty || !background_valid) {
         uint8_t state[] = {gb_cgb, gb_lcdc, gb_scx, gb_scy, gb_wx, gb_wy};
-        if (!scroll_background(state)) {
+        bool scrolled = scroll_background(state);
+        if (!scrolled) {
             incremental_background = background_valid && !memcmp(state, background_state, sizeof state);
             rebuild_background();
-            incremental_background = false;
         }
+        if (!incremental_background) {
+            background_start = 0;
+            background_end = GB_SCREEN_HEIGHT;
+        }
+        incremental_background = false;
         memcpy(background_state, state, sizeof state);
         background_valid = true;
         background_vram_dirty = false;
@@ -641,10 +654,8 @@ void gb_present_frame(void)
     uint8_t end = object_end > previous_object_end ? object_end : previous_object_end;
     previous_object_start = object_start;
     previous_object_end = object_end;
-    if (full_redraw) {
-        first = 0;
-        end = GB_SCREEN_HEIGHT;
-    }
+    if (background_start < first) first = background_start;
+    if (background_end > end) end = background_end;
     if (first < end) {
         uint8_t *line = (uint8_t *)lcd_Ram + ((LCD_HEIGHT - GB_SCREEN_HEIGHT) / 2 + first) * LCD_WIDTH
                                           + (LCD_WIDTH - GB_SCREEN_WIDTH) / 2;

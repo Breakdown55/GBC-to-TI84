@@ -6,7 +6,8 @@ from dataclasses import dataclass, replace
 from itertools import groupby
 from typing import Optional
 
-from translate import dispatch, lower_instruction, reuse_native_registers
+from translate import (BYTE_REGISTERS, dispatch, forward_native_flags, lower_instruction,
+                       native_entries, reuse_native_registers)
 
 
 BANK_SIZE = 0x4000
@@ -90,6 +91,20 @@ class Instruction:
     size: int
     text: str
     operand: int = 0
+
+    def register_only(self):
+        opcode = self.opcode
+        if 0x40 <= opcode < 0x80:
+            return opcode & 7 != 6 and (opcode >> 3) & 7 != 6
+        if 0x80 <= opcode < 0xc0:
+            return opcode & 7 != 6
+        if opcode == 0xcb:
+            return self.operand & 7 != 6
+        return opcode in (*IMMEDIATE_LOADS, *ALU_IMMEDIATE, 0x00, 0x07, 0x0f, 0x17, 0x1f,
+                          0x27, 0x2f, 0x37, 0x3f, 0xe8, 0xf8, 0xf9) or (
+            opcode < 0x40 and (opcode & 7 in (4, 5) and opcode not in (0x34, 0x35)
+                              or opcode & 15 in (1, 3, 9, 11))
+        )
 
     def tcycles(self):
         opcode = self.opcode
@@ -1322,6 +1337,55 @@ def copy_loop(bank, pc, instructions, ram_code):
     return layout, cursor + 1, end
 
 
+def fill_loop(bank, pc, instructions, ram_code):
+    """Match up to 32 consecutive stores inside the same counted fill loop."""
+    cursor = pc
+    for _ in range(32):
+        store = instructions.get((bank, cursor))
+        if store is None or store.opcode != 0x22:
+            break
+        cursor += 1
+    step = instructions.get((bank, cursor))
+    branch = instructions.get((bank, cursor + 1))
+    end = cursor + 3
+    if (cursor == pc or step is None or step.opcode not in (0x05, 0x0d)
+            or branch is None or branch.opcode != 0x20 or branch.operand != pc
+            or pc // BANK_SIZE != end // BANK_SIZE or (bank, end) not in instructions
+            or any(address in ram_code for address in range(pc, end))):
+        return None
+    return ((cursor - pc - 1) << 1) | int(step.opcode == 0x05), cursor + 1, end
+
+
+def counter_wait(bank, pc, instruction, instructions, cartridge):
+    """Finish an untimed INC/DEC byte, JR NZ spin loop, including copied HRAM."""
+    opcode = instruction.opcode
+    if opcode < 0 or opcode >= 0x40 or opcode & 7 not in (4, 5) or opcode in (0x34, 0x35):
+        return []
+    branch = instructions.get((bank, pc + 1))
+    end = pc + 3
+    if (branch is None or branch.opcode != 0x20 or branch.operand != pc
+            or pc // BANK_SIZE != end // BANK_SIZE or (bank, end) not in instructions):
+        return []
+    lines = []
+    slow = f".Lcounter_slow_{bank:03x}_{pc:04x}"
+    hram = [address in cartridge.ram_code for address in range(pc, end)]
+    if any(hram):
+        if not all(hram):
+            return []
+        for address in range(pc, end):
+            image, offset, _ = cartridge.instruction_bytes(bank, address)
+            lines.extend([f"    ld a, (_gb_hram+{address - HRAM_BASE})",
+                          f"    cp a, 0x{image[offset]:02x}", f"    jr nz, {slow}"])
+    flags = 0xc0 if opcode & 1 else 0xa0
+    register = BYTE_REGISTERS[REGISTERS[opcode >> 3]]
+    lines.extend(["    ld a, (_gb_f)", "    and a, 0x10", f"    or a, 0x{flags:02x}",
+                  "    ld (_gb_f), a", "    xor a, a", f"    ld ({register}), a",
+                  f"    jp _{symbol(bank, end)}"])
+    if any(hram):
+        lines.append(slow + ":")
+    return lines
+
+
 def lcd_poll_rule(bank, pc, instructions, ram_code):
     """Encode a side-effect-free LY/STAT poll followed by a branch back."""
     if pc // BANK_SIZE != (pc + 5) // BANK_SIZE or any(pc + i in ram_code for i in range(6)):
@@ -1376,14 +1440,12 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     bulk_backedges = {}
     if not timing:
         for (bank, pc), instruction in ordered:
-            step = instructions.get((bank, pc + 1))
-            branch = instructions.get((bank, pc + 2))
-            if (pc not in cartridge.ram_code and instruction.opcode == 0x22 and step is not None
-                    and step.opcode in (0x05, 0x0d) and branch is not None
-                    and branch.opcode == 0x20 and branch.operand == pc
-                    and native_destination(bank, pc, pc + 4, instructions) is not None):
-                bulk_loops[bank, pc] = "fill_hl", int(step.opcode == 0x05), pc + 4
-                bulk_backedges[bank, pc + 2] = pc
+            if instruction.opcode == 0x22:
+                fill = fill_loop(bank, pc, instructions, cartridge.ram_code)
+                if fill is not None:
+                    layout, backedge, end = fill
+                    bulk_loops[bank, pc] = "fill_hl", layout, end
+                    bulk_backedges[bank, backedge] = pc
             if instruction.opcode == 0x2a:
                 copy = copy_loop(bank, pc, instructions, cartridge.ram_code)
                 if copy is not None:
@@ -1403,6 +1465,12 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             ])
         opcode = instruction.opcode
         in_ram = pc in cartridge.ram_code
+        if not timing:
+            wait = counter_wait(bank, pc, instruction, instructions, cartridge)
+            if wait:
+                assembly.extend(wait)
+                if not in_ram:
+                    continue
         poll = lcd_poll_rule(bank, pc, instructions, cartridge.ram_code) if timing and opcode == 0xf0 else None
         if poll is not None:
             assembly.extend([f"    ld hl, 0x{poll:04x}", "    push hl",
@@ -1416,8 +1484,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         if fixed is not None:
             remaps = False
         if timing and opcode not in (CHECKPOINT, UNSUPPORTED):
+            boundary = "pure_boundary" if not in_ram and instruction.register_only() else "boundary"
             assembly.extend([f"    ld hl, 0x{pc:04x}", f"    ld de, {instruction.tcycles()}",
-                             "    call _gb_boundary"])
+                             f"    call _gb_{boundary}"])
         elif fixed is None and checked is None and (in_ram or remaps or cb_memory or opcode & 0xc7 == 0xc7 or opcode in (
                 CHECKPOINT, UNSUPPORTED, 0x10, 0x76, 0xcd, 0xe0, 0xe2, *MEMORY_LOADS, *PUSHES, *POPS,
                 *RETURNS, *CONDITIONAL_CALL) or 0x80 <= opcode < 0xc0 and opcode & 7 == 6):
@@ -1498,7 +1567,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         entry_labels.append(f"_{symbol(bank, pc)}")
         entries.append(f"    {{0x{pc:04x}, {symbol(bank, pc)}}},")
     if vblank_preview and not timing:
-        reuse_native_registers(assembly, predicted_entries.union(entry_labels))
+        external_entries = predicted_entries.union(entry_labels)
+        forward_native_flags(assembly, native_entries(assembly, external_entries))
+        reuse_native_registers(assembly, external_entries)
     if repeated:
         assembly = outline_repeated(assembly, repeated)
     spans = []
