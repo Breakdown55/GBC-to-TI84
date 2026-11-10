@@ -212,9 +212,19 @@ class RomTest(unittest.TestCase):
         data[0x100:0x100+len(code)] = code
         assembly, _ = compile_rom(data)
         self.assertEqual(assembly.count("call _gb_fill_hl"), 1)
-        self.assertIn("jp z, .Lfill_slow_000_0107", assembly)
+        self.assertIn("jp z, .Lbulk_slow_000_0107", assembly)
         timed, _ = compile_rom(data, timing=True, stop_at=(0,0x10b))
         self.assertNotIn("call _gb_fill_hl", timed)
+
+    def test_unrolled_page_copy_keeps_a_slow_backedge_and_timed_path(self):
+        data = cartridge_image()
+        code = bytes.fromhex("21 00 c0 11 00 80 0e 02 2a 12 1c 2a 12 13 0d 20 f7 76")
+        data[0x100:0x100 + len(code)] = code
+        assembly, _ = compile_rom(data)
+        self.assertIn("ld hl, 66\n    push hl\n    call _gb_copy_hl_de", assembly)
+        self.assertIn("jp z, .Lbulk_slow_000_0108", assembly)
+        timed, _ = compile_rom(data, timing=True, stop_at=(0, 0x111))
+        self.assertNotIn("call _gb_copy_hl_de", timed)
 
     def test_unknown_fill_counter_has_only_256_possible_lengths(self):
         from rom import State

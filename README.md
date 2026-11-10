@@ -42,7 +42,7 @@ The graphics buffers occupy the unused 76,800-byte half of LCD memory while the 
 
 The compiler also packs nearby cartridge data ranges together and shares repeated native instruction sequences in VBlank preview builds. It makes those decisions from the input ROM and generated code.
 
-Register arithmetic uses native eZ80 operations with Game Boy flag conversion. Plain WRAM and HRAM accesses have native fast paths, while mapped devices retain their memory handlers. In untimed modes, recognized byte-fill loops can use bulk fills when the entire destination is safe; timed builds retain individual instruction boundaries. Static analysis also summarizes these bounded fills and can merge compatible RAM facts between frames during continuous discovery.
+Register arithmetic uses native eZ80 operations with Game Boy flag conversion. Plain WRAM and HRAM accesses and fixed-WRAM stack operations have native fast paths, while mapped devices retain their memory handlers. In untimed modes, recognized fill and copy loops can operate on whole contiguous ranges after checking their mappings. Timed builds retain individual instruction boundaries. Static analysis also summarizes bounded fills and can merge compatible RAM facts between frames during continuous discovery.
 
 For a cartridge that waits at `HALT` for VBlank, build a live preview with:
 

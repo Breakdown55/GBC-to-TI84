@@ -1290,6 +1290,38 @@ def fixed_memory_access(data, instruction):
     return ["ld a, (_gb_a)", f"ld ({cell}), a"]
 
 
+def copy_loop(bank, pc, instructions, ram_code):
+    """Recognize a counted HL-to-DE copy, including unrolled page copies."""
+    if pc in ram_code:
+        return None
+    cursor = pc
+    steps = []
+    for _ in range(32):
+        triple = tuple(instructions.get((bank, cursor + i)) for i in range(3))
+        if any(instruction is None for instruction in triple):
+            break
+        load, store, increment = (instruction.opcode for instruction in triple)
+        if (load, store) != (0x2a, 0x12) or increment not in (0x13, 0x1c):
+            break
+        steps.append(increment)
+        cursor += 3
+    if not steps or steps[-1] != 0x13:
+        return None
+    page_step = steps[0] == 0x1c
+    if any(step != steps[0] for step in steps[:-1]):
+        return None
+    step = instructions.get((bank, cursor))
+    branch = instructions.get((bank, cursor + 1))
+    end = cursor + 3
+    if (step is None or step.opcode not in (0x05, 0x0d) or branch is None
+            or branch.opcode != 0x20 or branch.operand != pc
+            or pc // BANK_SIZE != end // BANK_SIZE or (bank, end) not in instructions
+            or any(address in ram_code for address in range(pc, end))):
+        return None
+    layout = len(steps) | (0x40 if page_step else 0) | (0x80 if step.opcode == 0x05 else 0)
+    return layout, cursor + 1, end
+
+
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
                 analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=()):
@@ -1318,7 +1350,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     helpers = set()
     repeated = {}
     ordered = sorted(instructions.items())
-    fill_loops = {}
+    bulk_loops = {}
+    bulk_backedges = {}
     if not timing:
         for (bank, pc), instruction in ordered:
             step = instructions.get((bank, pc + 1))
@@ -1327,16 +1360,24 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                     and step.opcode in (0x05, 0x0d) and branch is not None
                     and branch.opcode == 0x20 and branch.operand == pc
                     and native_destination(bank, pc, pc + 4, instructions) is not None):
-                fill_loops[bank, pc] = int(step.opcode == 0x05)
+                bulk_loops[bank, pc] = "fill_hl", int(step.opcode == 0x05), pc + 4
+                bulk_backedges[bank, pc + 2] = pc
+            if instruction.opcode == 0x2a:
+                copy = copy_loop(bank, pc, instructions, cartridge.ram_code)
+                if copy is not None:
+                    layout, backedge, end = copy
+                    bulk_loops[bank, pc] = "copy_hl_de", layout, end
+                    bulk_backedges[bank, backedge] = pc
     for (bank, pc), instruction in ordered:
         name = symbol(bank, pc)
         targets.append(f"extern void {name}(void);")
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
-        if (bank, pc) in fill_loops:
+        if (bank, pc) in bulk_loops:
+            helper, argument, end = bulk_loops[bank, pc]
             assembly.extend([
-                f"    ld hl, {fill_loops[bank, pc]}", "    push hl", "    call _gb_fill_hl",
-                "    pop de", "    or a, a", f"    jp nz, _{symbol(bank, pc + 4)}",
-                f".Lfill_slow_{bank:03x}_{pc:04x}:",
+                f"    ld hl, {argument}", "    push hl", f"    call _gb_{helper}",
+                "    pop de", "    or a, a", f"    jp nz, _{symbol(bank, end)}",
+                f".Lbulk_slow_{bank:03x}_{pc:04x}:",
             ])
         opcode = instruction.opcode
         in_ram = pc in cartridge.ram_code
@@ -1369,8 +1410,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 assembly.extend([f"    ld a, (_gb_hram+{pc - HRAM_BASE + index})",
                                  f"    cp a, 0x{byte:02x}", "    jp nz, _gb_unmapped"])
         native = None if timing else direct_branch(bank, pc, instruction, instructions)
-        if native is not None and (bank, pc - 2) in fill_loops:
-            native = [line.replace(f"_{symbol(bank, pc - 2)}", f".Lfill_slow_{bank:03x}_{pc - 2:04x}")
+        if native is not None and (bank, pc) in bulk_backedges:
+            start = bulk_backedges[bank, pc]
+            native = [line.replace(f"_{symbol(bank, start)}", f".Lbulk_slow_{bank:03x}_{start:04x}")
                       for line in native]
         if native is not None:
             assembly.extend(f"    {line}" for line in native)

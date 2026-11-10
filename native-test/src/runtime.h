@@ -47,7 +47,7 @@ extern volatile uint24_t gb_pc;
 extern volatile uint24_t gb_hl; /* Zero-extended Game Boy HL for ADL code. */
 extern volatile uint24_t gb_bc;
 extern volatile uint24_t gb_de;
-extern volatile uint16_t gb_sp;
+extern volatile uint24_t gb_sp; /* Game Boy SP, zero extended for native loads. */
 extern volatile uint8_t gb_a;
 extern volatile uint8_t gb_f;
 extern volatile uint8_t gb_ime;
@@ -83,8 +83,6 @@ void gb_inc_c(void);
 void gb_dec_c(void);
 void gb_sub_l(void);
 void gb_srl_a(void);
-void gb_add_hl_de(void);
-void gb_add_hl(uint24_t value);
 void gb_ld_hl_sp(uint8_t offset);
 void gb_add_sp(uint8_t offset);
 uint8_t gb_step_byte(uint8_t value, uint8_t decrement);
@@ -102,6 +100,7 @@ uint8_t gb_store_hli(void);
 uint8_t gb_store_hld(void);
 uint8_t gb_store_hl(void);
 uint8_t gb_fill_hl(uint8_t use_b);
+uint8_t gb_copy_hl_de(uint8_t layout);
 uint8_t gb_set_hl_bit(uint8_t bit);
 uint8_t gb_store_a(uint24_t address);
 uint24_t gb_read_byte(uint24_t address);

@@ -34,18 +34,15 @@ _gb_fast_\name:
     fast_hl store_hli, store_hli, 1, 1
     fast_hl store_hld, store_hld, 1, -1
 
-/* The translated code passes the guest address in HL and the store value in A.
- * Preserve the address only until we know whether the bus handler is needed. */
+/* The translated code passes the guest address in HL and the store value in A. */
     .global _gb_read_indirect
 _gb_read_indirect:
-    push hl
     call .Lplain_ram
-    pop bc
     jr c, .Lread_bus
     ld a, (hl)
     ret
 .Lread_bus:
-    push bc
+    push hl
     call _gb_read_byte
     pop bc
     ld a, h
@@ -56,16 +53,13 @@ _gb_read_indirect:
     .global _gb_write_indirect
 _gb_write_indirect:
     ld c, a
-    push hl
     call .Lplain_ram
     jr c, .Lwrite_bus
-    pop de
     ld (hl), c
     ld a, 1
     or a, a
     ret
 .Lwrite_bus:
-    pop hl
     ld de, 0
     ld e, c
     push de
@@ -77,7 +71,7 @@ _gb_write_indirect:
     ret
 
 /* Only plain WRAM, its echo, and HRAM bypass the general memory bus.
- * VRAM, OAM, ROM, cartridge RAM, and MMIO retain their existing side effects. */
+ * Rejection sets carry and leaves HL and BC intact for the checked path. */
 .Lplain_ram:
     ld a, h
     cp a, 0xc0
@@ -163,6 +157,22 @@ _gb_native_step_flags:
     ld a, d
     ret
 
+    .global _gb_native_add16_flags
+_gb_native_add16_flags:
+    push af
+    pop bc
+    ld de, .Lflag_map
+    ld e, c
+    ld a, (de)
+    and a, 0x30
+    ld c, a
+    ld a, (_gb_f)
+    and a, 0x80
+    or a, c
+    ld (_gb_f), a
+    ld a, b
+    ret
+
     .section .rodata.gb_native_flags
     .balign 256
 .Lflag_map:
@@ -179,32 +189,24 @@ _gb_native_step_flags:
     .global _gb_call_native
 
 _gb_call_native:
-    push hl             ; Preserve the proven native target while pushing the guest return.
-    push de
-    call _gb_push_word
-    pop bc
+    push hl
+    call .Lpush_guest_de
     pop hl
     or a, a
     jp z, _gb_unmapped
     jp (hl)
 
 _gb_call:
-    push hl             ; Save the target across the helper call.
-    push de             ; Pass the Game Boy return address to C.
-    call _gb_push_word
-    pop bc
+    push hl
+    call .Lpush_guest_de
     pop hl
     or a, a
     jp z, _gb_unmapped
     jr _gb_dispatch
 
 _gb_ret:
-    call _gb_pop_word
-    ld de, 0x10000
-    or a, a
-    sbc hl, de
-    jp nc, _gb_unmapped
-    add hl, de
+    call _gb_fast_pop
+    jp c, _gb_unmapped
 
 _gb_dispatch:
     ld (_gb_pc), hl
@@ -259,6 +261,73 @@ _gb_dispatch:
     sbc hl, de
     jp z, _gb_missing_target
     jp (hl)
+
+    .section .text.gb_fast_stack
+    .global _gb_fast_push
+    .global _gb_fast_pop
+/* Only fixed WRAM uses these paths. Other regions, including a stack word
+ * split across banks, use the checked C helpers. */
+_gb_fast_push:
+    ex de, hl
+.Lpush_guest_de:
+    ld hl, (_gb_sp)
+    ld bc, 0xc002
+    or a, a
+    sbc hl, bc
+    ld bc, 0x0fff
+    or a, a
+    sbc hl, bc
+    jr nc, .Lpush_bus
+    add hl, bc
+    ld bc, _gb_wram
+    add hl, bc
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    ld hl, (_gb_sp)
+    dec hl
+    dec hl
+    ld (_gb_sp), hl
+    ld a, 1
+    ret
+.Lpush_bus:
+    push de
+    call _gb_push_word
+    pop bc
+    ret
+
+_gb_fast_pop:
+    ld hl, (_gb_sp)
+    ld de, 0xc000
+    or a, a
+    sbc hl, de
+    ld de, 0x0fff
+    or a, a
+    sbc hl, de
+    jr nc, .Lpop_bus
+    add hl, de
+    ld de, _gb_wram
+    add hl, de
+    ld de, 0
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    ld hl, (_gb_sp)
+    inc hl
+    inc hl
+    ld (_gb_sp), hl
+    ex de, hl
+    ret
+.Lpop_bus:
+    call _gb_pop_word
+    ld de, 0x10000
+    or a, a
+    sbc hl, de
+    ccf
+    ret c
+    add hl, de
+    or a, a
+    ret
 
     .section .text.gb_timing_dispatch
     .global _gb_boundary
@@ -319,12 +388,8 @@ _gb_preview_vblank:
     jp _gb_dispatch
 
 _gb_preview_reti:
-    call _gb_pop_word
-    ld de, 0x10000
-    or a, a
-    sbc hl, de
-    jp nc, _gb_unmapped
-    add hl, de
+    call _gb_fast_pop
+    jp c, _gb_unmapped
     ld (_gb_pc), hl
     call _gb_timing_enable_ime
     call _gb_preview_finish

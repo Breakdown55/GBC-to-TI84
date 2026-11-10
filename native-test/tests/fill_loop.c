@@ -54,5 +54,24 @@ int main(void)
     }
     gb_hl=0x8000;gb_bc=1;gb_a=gb_vram[1][0];invalidations=0;
     assert(gb_fill_hl(0)&&!invalidations);
+
+    for (unsigned i = 0; i < 32; ++i) gb_wram_banks[6][i] = i + 1;
+    gb_hl = 0xd000; gb_de = 0x8ff0; gb_bc = 0x5302; gb_f = 0x30;
+    invalidations = 0;
+    assert(gb_copy_hl_de(0x40 | 16));
+    assert(!memcmp(&gb_vram[1][0xff0], gb_wram_banks[6], 32));
+    assert(gb_hl == 0xd020 && gb_de == 0x9010 && gb_bc == 0x5300 && gb_a == 32 && gb_f == 0xd0);
+    assert(invalidations == 1 && bank_seen == 1 && offset_seen == 0xff0 && length_seen == 32);
+    gb_hl = 0xd000; gb_de = 0x8ff0; gb_bc = 2; invalidations = 0;
+    assert(gb_copy_hl_de(0x40 | 16) && !invalidations);
+    gb_hl = 0xd000; gb_de = 0x8ff1; gb_bc = 2;
+    assert(!gb_copy_hl_de(0x40 | 16) && gb_de == 0x8ff1 && gb_bc == 2 && !invalidations);
+    gb_hl = 0xc000; gb_de = 0xe001; gb_bc = 2;
+    assert(!gb_copy_hl_de(1) && gb_hl == 0xc000 && gb_de == 0xe001);
+    gb_hl = 0xd000; gb_de = 0xfdff; gb_bc = 2;
+    assert(!gb_copy_hl_de(1) && gb_de == 0xfdff);
+
     gb_timing_enabled=1;gb_hl=0xc000;gb_bc=1;assert(!gb_fill_hl(0));assert(gb_bc==1);
+    gb_de = 0xc100;
+    assert(!gb_copy_hl_de(1));
 }

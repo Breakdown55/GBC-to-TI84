@@ -90,8 +90,11 @@ def reuse_native_registers(assembly, dispatch_entries):
         if A_ARITHMETIC.fullmatch(operation) or operation in ("inc a", "dec a", "cpl", *ROTATES):
             resident.discard("a")
             continue
-        if operation in ("inc hl", "dec hl", "call _gb_native_flags", "call _gb_native_step_flags"):
+        if operation in ("inc hl", "dec hl", "add.s hl, hl", "add.s hl, de",
+                         "call _gb_native_flags", "call _gb_native_step_flags"):
             resident.discard("hl")
+            continue
+        if operation == "call _gb_native_add16_flags":
             continue
         # Branches, fault paths, arbitrary memory operations and other helpers
         # may read or replace any canonical guest state.
@@ -174,11 +177,6 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             return [*call_with_arg("gb_step_hl", decrement), *FAULT_IF_ZERO], 1
     if len(parts) == 2 and parts[0] in ("inc", "dec") and parts[1] in ("bc", "de", "hl", "sp"):
         operation, register = parts
-        if register == "sp":
-            return [
-                "ld hl, 0", "ld a, (_gb_sp)", "ld l, a", "ld a, (_gb_sp+1)", "ld h, a",
-                f"{operation} hl", "ld a, l", "ld (_gb_sp), a", "ld a, h", "ld (_gb_sp+1), a",
-            ], 1
         return [
             f"ld hl, (_gb_{register})", f"{operation} hl", f"ld (_gb_{register}), hl",
             "xor a, a", f"ld (_gb_{register}+2), a",
@@ -207,14 +205,12 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
     if parts in (["scf"], ["ccf"]):
         change = ["and a, 0x80", "or a, 0x10"] if parts[0] == "scf" else ["and a, 0x90", "xor a, 0x10"]
         return ["ld a, (_gb_f)", *change, "ld (_gb_f), a"], 1
-    if re.fullmatch(r"add\s+hl\s*,\s*de", normalized):
-        return ["call _gb_add_hl_de"], 1
-    add_hl = re.fullmatch(r"add\s+hl\s*,\s*(bc|hl|sp)", normalized)
+    add_hl = re.fullmatch(r"add\s+hl\s*,\s*(bc|de|hl|sp)", normalized)
     if add_hl:
         register = add_hl[1]
-        operand = (["ld hl, 0", "ld a, (_gb_sp)", "ld l, a", "ld a, (_gb_sp+1)", "ld h, a"]
-                   if register == "sp" else [f"ld hl, (_gb_{register})"])
-        return [*operand, "push hl", "call _gb_add_hl", "pop bc"], 1
+        operand = [] if register == "hl" else [f"ld de, (_gb_{register})"]
+        return [*operand, "ld hl, (_gb_hl)", f"add.s hl, {'hl' if register == 'hl' else 'de'}",
+                "ld (_gb_hl), hl", "call _gb_native_add16_flags"], 1
     set_hl = re.fullmatch(r"set\s+([0-7])\s*,\s*\[hl\]", normalized)
     if set_hl:
         return [*call_with_arg("gb_set_hl_bit", int(set_hl[1])), *FAULT_IF_ZERO], 2
@@ -265,9 +261,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         dest, source = (BYTE_REGISTERS[register] for register in register_load.groups())
         return [f"ld a, ({source})", f"ld ({dest}), a"], 1
     if re.fullmatch(r"ld\s+sp\s*,\s*hl", normalized):
-        return [
-            "ld hl, (_gb_hl)", "ld a, l", "ld (_gb_sp), a", "ld a, h", "ld (_gb_sp+1), a",
-        ], 1
+        return ["ld hl, (_gb_hl)", "ld (_gb_sp), hl"], 1
     load = re.fullmatch(r"ld\s+(a|b|c|d|e|h|l|bc|de|hl|sp)\s*,\s*\$([0-9a-f]{1,4})", normalized)
     if load:
         register, digits = load.groups()
@@ -275,15 +269,8 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         if register in BYTE_REGISTERS and len(digits) <= 2:
             operand = f"(_gb_hram+{pc + 1 - 0xff80})" if live_immediate else f"0x{value:02x}"
             return [f"ld a, {operand}", f"ld ({BYTE_REGISTERS[register]}), a"], 2
-        if register in ("bc", "de", "hl"):
+        if register in ("bc", "de", "hl", "sp"):
             return [f"ld hl, 0x{value:04x}", f"ld (_gb_{register}), hl"], 3
-        if register == "sp":
-            return [
-                f"ld a, 0x{value & 0xff:02x}",
-                "ld (_gb_sp), a",
-                f"ld a, 0x{value >> 8:02x}",
-                "ld (_gb_sp+1), a",
-            ], 3
     indirect_store = re.fullmatch(r"ld\s+\[hl([+-]?)\]\s*,\s*a", normalized)
     if indirect_store:
         helper = {"": "gb_fast_store_hl", "+": "gb_fast_store_hli", "-": "gb_fast_store_hld"}[indirect_store[1]]
@@ -345,14 +332,13 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
             load_word = [
                 "ld hl, 0", "ld a, (_gb_a)", "ld h, a", "ld a, (_gb_f)", "ld l, a",
             ] if parts[1] == "af" else [f"ld hl, ({symbol})"]
-            return [*load_word, "push hl", "call _gb_push_word", "pop bc", *FAULT_IF_ZERO], 1
+            return [*load_word, "call _gb_fast_push", *FAULT_IF_ZERO], 1
         if parts[0] == "pop":
             store_word = [
                 "ld a, h", "ld (_gb_a), a", "ld a, l", "and a, 0xf0", "ld (_gb_f), a",
             ] if parts[1] == "af" else [f"ld ({symbol}), hl"]
             return [
-                "call _gb_pop_word", "ld de, 0x10000", "or a, a",
-                "sbc hl, de", "jp nc, _gb_unmapped", "add hl, de", *store_word,
+                "call _gb_fast_pop", "jp c, _gb_unmapped", *store_word,
             ], 1
     if parts == ["ret"]:
         return ["jp _gb_ret"], None

@@ -40,7 +40,7 @@ volatile uint24_t gb_pc;
 volatile uint24_t gb_hl;
 volatile uint24_t gb_bc;
 volatile uint24_t gb_de;
-volatile uint16_t gb_sp;
+volatile uint24_t gb_sp;
 volatile uint8_t gb_a;
 volatile uint8_t gb_f;
 volatile uint8_t gb_ime;
@@ -104,22 +104,6 @@ void gb_srl_a(void)
     uint8_t result = a >> 1;
     gb_a = result;
     gb_f = (result == 0 ? GB_FLAG_Z : 0) | (a & 1 ? GB_FLAG_C : 0);
-}
-
-void gb_add_hl_de(void)
-{
-    gb_add_hl(gb_de);
-}
-
-void gb_add_hl(uint24_t value)
-{
-    uint16_t hl = (uint16_t)gb_hl;
-    uint16_t word = (uint16_t)value;
-    uint24_t sum = (uint24_t)hl + word;
-    gb_f = (gb_f & GB_FLAG_Z) |
-           ((hl & 0x0fff) + (word & 0x0fff) > 0x0fff ? GB_FLAG_H : 0) |
-           (sum > 0xffff ? GB_FLAG_C : 0);
-    gb_hl = (uint16_t)sum;
 }
 
 uint8_t gb_step_byte(uint8_t value, uint8_t decrement)
@@ -860,6 +844,58 @@ uint8_t gb_fill_hl(uint8_t use_b)
     return 1;
 }
 
+static uint8_t *copy_ram_range(unsigned address, unsigned length)
+{
+    if (address >= 0x8000 && address < 0xa000 && length <= 0xa000 - address) {
+        return &gb_vram[gb_cgb ? gb_vbk : 0][address - 0x8000];
+    }
+    if (address >= 0xe000 && address < 0xfe00) {
+        if (length > 0xfe00 - address) return 0;
+        address -= 0x2000;
+    }
+    if (address >= 0xc000 && address < 0xe000 && length <= 0x1000 - (address & 0xfff)) {
+        return work_or_high_ram_byte(address);
+    }
+    if (address >= 0xff80 && address < 0xffff && length <= 0xffff - address) {
+        return &gb_hram[address - 0xff80];
+    }
+    return 0;
+}
+
+/* Fuse a counted sequence of LD A,[HL+] / LD [DE],A / INC DE (or INC E).
+ * Side effects, unsafe overlap, or an unretained source require the original loop. */
+uint8_t gb_copy_hl_de(uint8_t layout)
+{
+    unsigned width = layout & 0x3f;
+    if (gb_timing_enabled || !width) return 0;
+    bool use_b = layout & 0x80;
+    unsigned count = use_b ? (gb_bc >> 8) & 255 : gb_bc & 255;
+    unsigned length = (count ? count : 256) * width;
+    unsigned source = (uint16_t)gb_hl, destination = (uint16_t)gb_de;
+    if ((layout & 0x40) && length > 256 - (destination & 255) &&
+        (256 % width || (destination & 255) % width)) return 0;
+
+    uint8_t *output = copy_ram_range(destination, length);
+    if (!output) return 0;
+    const uint8_t *input = source < 0x8000 ? gb_read_contiguous(source, length) : copy_ram_range(source, length);
+    if (!input) return 0;
+    if (input != output) {
+        uintptr_t from = (uintptr_t)input, to = (uintptr_t)output;
+        if (from < to + length && to < from + length) return 0;
+        bool video = destination < 0xa000;
+        if (!video || memcmp(output, input, length)) {
+            memcpy(output, input, length);
+            if (video) gb_video_invalidate(gb_cgb ? gb_vbk : 0, destination - 0x8000, length);
+        }
+    }
+    gb_a = input[length - 1];
+    gb_hl = (uint16_t)(source + length);
+    gb_de = (uint16_t)(destination + length);
+    gb_bc &= use_b ? 0xff : 0xff00;
+    gb_f = (gb_f & GB_FLAG_C) | GB_FLAG_Z | GB_FLAG_N;
+    return 1;
+}
+
 uint8_t gb_set_hl_bit(uint8_t bit)
 {
     uint16_t address = (uint16_t)gb_hl;
@@ -909,22 +945,25 @@ GbNativeBlock gb_lookup(uint24_t address)
     }
     uint16_t bank = address >= 0x4000 && address < 0x8000 ? gb_rom_bank : 0;
     unsigned slot = (address ^ (address >> 8) ^ bank) & (LOOKUP_CACHE_SIZE - 1);
-    unsigned first = 0, last = gb_target_bank_count;
-    while (first < last) {
-        unsigned middle = first + (last - first) / 2;
-        const GbTargetBank *group = &gb_target_banks[middle];
-        if (group->bank == bank) {
-            GbNativeBlock entry = lookup_address(group, (uint16_t)address);
-            gb_lookup_cache[slot] = (LookupCacheEntry){(uint16_t)address, bank, entry, 0};
-            return entry;
-        }
-        if (group->bank < bank) {
-            first = middle + 1;
-        } else {
-            last = middle;
+    if (!gb_target_bank_count) return 0;
+    static const GbTargetBank *last_switch_group;
+    const GbTargetBank *group = gb_target_banks;
+    if (group->bank != bank) {
+        group = last_switch_group;
+        if (!group || group->bank != bank) {
+            unsigned first = 1, last = gb_target_bank_count;
+            while (first < last) {
+                unsigned middle = first + (last - first) / 2;
+                if (gb_target_banks[middle].bank < bank) first = middle + 1;
+                else last = middle;
+            }
+            if (first == gb_target_bank_count || gb_target_banks[first].bank != bank) return 0;
+            last_switch_group = group = &gb_target_banks[first];
         }
     }
-    return 0;
+    GbNativeBlock entry = lookup_address(group, (uint16_t)address);
+    gb_lookup_cache[slot] = (LookupCacheEntry){(uint16_t)address, bank, entry, 0};
+    return entry;
 }
 
 uint8_t gb_push_word(uint24_t value)
@@ -943,7 +982,7 @@ uint8_t gb_push_word(uint24_t value)
         *high = (uint8_t)(value >> 8);
         *low = (uint8_t)value;
     }
-    gb_sp = sp - 2;
+    gb_sp = (uint16_t)(sp - 2);
     return 1;
 }
 
@@ -962,6 +1001,6 @@ uint24_t gb_pop_word(void)
         }
         value = *low | ((uint16_t)*high << 8);
     }
-    gb_sp = sp + 2;
+    gb_sp = (uint16_t)(sp + 2);
     return value;
 }
