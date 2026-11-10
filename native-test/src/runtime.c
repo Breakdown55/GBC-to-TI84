@@ -549,12 +549,11 @@ uint8_t gb_watch_ram(uint16_t address)
     return byte ? *byte : 0xff;
 }
 
-static const GbRomSpan *cache_rom_span(const GbRomSpan *span)
+static void cache_rom_read(uint16_t start, uint16_t length, const uint8_t *bytes)
 {
-    gb_rom_read_cache.start = span->address;
-    gb_rom_read_cache.bias = (uintptr_t)(gb_rom_payload + span->offset) - span->address;
-    gb_rom_read_cache.length = span->length;
-    return span;
+    gb_rom_read_cache.start = start;
+    gb_rom_read_cache.bias = (uintptr_t)bytes - start;
+    gb_rom_read_cache.length = length;
 }
 
 static const GbRomSpan *find_rom_span(uint16_t address)
@@ -563,7 +562,10 @@ static const GbRomSpan *find_rom_span(uint16_t address)
     uint16_t bank = address < 0x4000 ? 0 : gb_rom_bank;
     if (last_span && last_span->bank == bank &&
         (uint16_t)(address - last_span->address) < last_span->length) {
-        return gb_rom_read_cache.length ? last_span : cache_rom_span(last_span);
+        if (!gb_rom_read_cache.length || gb_rom_read_cache.start != last_span->address) {
+            cache_rom_read(last_span->address, last_span->length, gb_rom_payload + last_span->offset);
+        }
+        return last_span;
     }
     unsigned first = 0, last = gb_rom_data_count;
     while (first < last) {
@@ -574,9 +576,23 @@ static const GbRomSpan *find_rom_span(uint16_t address)
         } else if (span->bank > bank || address < span->address) {
             last = middle;
         } else {
-            return last_span = cache_rom_span(span);
+            cache_rom_read(span->address, span->length, gb_rom_payload + span->offset);
+            return last_span = span;
         }
     }
+#if GB_ROM_CHUNKS
+    /* Cache the archive gap without replacing faster embedded bytes. */
+    uint16_t start = address & 0x4000, end = start + 0x4000;
+    if (first && gb_rom_data[first - 1].bank == bank) {
+        const GbRomSpan *previous = &gb_rom_data[first - 1];
+        start = previous->address + previous->length;
+    }
+    if (first < gb_rom_data_count && gb_rom_data[first].bank == bank) {
+        end = gb_rom_data[first].address;
+    }
+    const uint8_t *bytes = gb_archive_pointer(start, end - start);
+    if (bytes) cache_rom_read(start, end - start, bytes);
+#endif
     return 0;
 }
 

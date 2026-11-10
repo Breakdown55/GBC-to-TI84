@@ -5,7 +5,7 @@ import sys
 import unittest
 
 from rom import BANK_SIZE, CHECKPOINT, Cartridge, compile_rom
-from translate import forward_native_flags, native_entries
+from translate import forward_native_flags, native_entries, omit_dead_flag_updates
 
 
 def cartridge_image():
@@ -254,6 +254,24 @@ class RomTest(unittest.TestCase):
         self.assertEqual(optimized[-3:], ["", "", "    jp z, .Ltaken"])
         forward_native_flags(lines, native_entries(lines, ["_gb_000_0102"]))
         self.assertEqual(lines[-2:], ["    bit 7, a", "    jp nz, .Ltaken"])
+
+    def test_native_flag_forwarding_only_uses_carry_when_defined(self):
+        for helper in ("bit", "step"):
+            lines = [f"    call _gb_native_{helper}_flags", "    ld a, (_gb_f)",
+                     "    bit 4, a", "    jp nz, .Ltaken"]
+            forward_native_flags(lines, set())
+            self.assertEqual(lines[-1], "    jp nz, .Ltaken")
+            lines[-2] = "    bit 7, a"
+            forward_native_flags(lines, set())
+            self.assertEqual(lines[-1], "    jp z, .Ltaken")
+
+    def test_dead_flags_require_an_overwrite_before_any_exit_or_read(self):
+        conversion = "    call _gb_native_flags"
+        lines = [conversion, "    xor a, a", conversion, "    ld a, (_gb_f)",
+                 conversion, "    jp .Lexit", conversion]
+        omit_dead_flag_updates(lines)
+        self.assertEqual(lines[0], "")
+        self.assertTrue(all(lines[i] == conversion for i in (2, 4, 6)))
 
     def test_unknown_fill_counter_has_only_256_possible_lengths(self):
         from rom import State

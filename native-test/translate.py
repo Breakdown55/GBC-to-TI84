@@ -40,6 +40,11 @@ WORD_STEP = re.compile(r"(?:inc|dec)\.s (bc|de|hl)")
 A_ARITHMETIC = re.compile(r"(?:add|adc|sub|sbc|and|xor|or) a, (?:[abcdehl]|0x[0-9a-f]+)")
 A_COMPARE = re.compile(r"cp a, (?:[abcdehl]|0x[0-9a-f]+)")
 FLAG_BRANCH = re.compile(r"(jp|jr) (z|nz), (\S+)")
+NATIVE_FLAG_BITS = {
+    "call _gb_native_flags": ("bit 4, a", "bit 7, a"),
+    "call _gb_native_step_flags": ("bit 7, a",),
+    "call _gb_native_bit_flags": ("bit 7, a",),
+}
 
 
 def native_entries(assembly, dispatch_entries):
@@ -52,19 +57,19 @@ def native_entries(assembly, dispatch_entries):
 
 def forward_native_flags(assembly, entries):
     """Use live host Z/C after the flag conversion helper when no entry intervenes."""
-    live = False
+    live = ()
     for index, line in enumerate(assembly):
         operation = line.strip()
         if not operation or operation.startswith((".assume ", ".section ", ".global ")):
             continue
         if operation.endswith(":") and GUEST_LABEL.fullmatch(operation[:-1]) and operation[:-1] not in entries:
             continue
-        if operation == "call _gb_native_flags":
-            live = True
+        if operation in NATIVE_FLAG_BITS:
+            live = NATIVE_FLAG_BITS[operation]
         elif live and operation == "ld a, (_gb_f)" and index + 2 < len(assembly):
             test = assembly[index + 1].strip()
             branch = FLAG_BRANCH.fullmatch(assembly[index + 2].strip())
-            if test in ("bit 4, a", "bit 7, a") and branch:
+            if test in live and branch:
                 jump, condition, target = branch.groups()
                 native = ("c" if condition == "nz" else "nc") if test == "bit 4, a" else (
                     "z" if condition == "nz" else "nz"
@@ -72,7 +77,22 @@ def forward_native_flags(assembly, entries):
                 assembly[index] = assembly[index + 1] = ""
                 assembly[index + 2] = f"    {jump} {native}, {target}"
         elif not operation.startswith("ld ") or operation.startswith("ld (_gb_f),"):
+            live = ()
+
+
+def omit_dead_flag_updates(assembly):
+    """Skip a full flag conversion if a later write replaces it on this path."""
+    live = True
+    for index in range(len(assembly) - 1, -1, -1):
+        operation = assembly[index].strip()
+        if operation == "call _gb_native_flags":
+            if not live:
+                assembly[index] = ""
             live = False
+        elif operation.startswith("ld (_gb_f),"):
+            live = False
+        elif "(_gb_f)" in operation or operation.startswith(("jp ", "jr ", "call ", "ret", "djnz ")):
+            live = True
 
 
 def reuse_native_registers(assembly, dispatch_entries):
@@ -136,6 +156,9 @@ def reuse_native_registers(assembly, dispatch_entries):
             continue
         if operation == "call _gb_native_step_flags":
             resident.difference_update(("hl", "de", "bc"))
+            continue
+        if operation == "call _gb_native_bit_flags":
+            resident.discard("de")
             continue
         if operation == "call _gb_native_add16_flags":
             resident.difference_update(("de", "bc"))
@@ -270,12 +293,7 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         if operation != "bit":
             store = write_indirect_byte() if register == "[hl]" else [f"ld ({BYTE_REGISTERS[register]}), a"]
             return [*load, f"{operation} {bit}, a", *store], 2
-        return [
-            *load, f"bit {bit}, a",
-            "ld a, 0x20", "jr nz, 1f", "ld a, 0xa0", "1:",
-            "ld b, a", "ld a, (_gb_f)", "and a, 0x10",
-            "or a, b", "ld (_gb_f), a",
-        ], 2
+        return [*load, f"bit {bit}, a", "call _gb_native_bit_flags"], 2
     shift = re.fullmatch(r"(rlc|rrc|rl|rr|sla|sra|swap|srl)\s+([abcdehl]|\[hl\])", normalized)
     if shift:
         operation, register = shift.groups()
@@ -285,10 +303,8 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
         if operation in ("rl", "rr"):
             carry = ["ld c, a", "ld a, (_gb_f)", "and a, 0x10", "add a, 0xf0", "ld a, c"]
         native = ["rlca", "rlca", "rlca", "rlca", "or a, a"] if operation == "swap" else [f"{operation} a"]
-        return [
-            *load, *carry, *native, "ld b, 0", "jr nz, 1f", "set 7, b", "1:",
-            "jr nc, 2f", "set 4, b", "2:", "ld c, a", "ld a, b", "ld (_gb_f), a", "ld a, c", *store,
-        ], 2
+        # The eZ80's CB shifts set Z/C and clear H/N, just like the guest.
+        return [*load, *carry, *native, "call _gb_native_flags", *store], 2
     alu = re.fullmatch(r"(add|adc|sub|sbc|and|xor|or|cp)\s+(?:a\s*,\s*)?([abcdehl]|\[hl\]|\$[0-9a-f]{1,2})", normalized)
     if alu:
         operation, operand = alu.groups()

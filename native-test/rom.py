@@ -7,7 +7,7 @@ from itertools import groupby
 from typing import Optional
 
 from translate import (BYTE_REGISTERS, dispatch, forward_native_flags, lower_instruction,
-                       native_entries, reuse_native_registers)
+                       native_entries, omit_dead_flag_updates, reuse_native_registers)
 
 
 BANK_SIZE = 0x4000
@@ -1569,6 +1569,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     if vblank_preview and not timing:
         external_entries = predicted_entries.union(entry_labels)
         forward_native_flags(assembly, native_entries(assembly, external_entries))
+        omit_dead_flag_updates(assembly)
         reuse_native_registers(assembly, external_entries)
     if repeated:
         assembly = outline_repeated(assembly, repeated)

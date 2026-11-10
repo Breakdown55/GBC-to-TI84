@@ -430,8 +430,17 @@ static uint16_t background_tile_keys[BACKGROUND_TILE_SLOTS];
 _Static_assert(CACHE_BYTES + BACKGROUND_TILE_SLOTS * TILE_PIXELS <= LCD_SIZE / 2,
                "background tile cache exceeds spare LCD RAM");
 
-/* A rebuild reads stable VRAM. Cache palette and flip variants for that
- * rebuild, so rectangles sharing a tile can copy its rows directly. */
+/* Preserve palette and flip variants until the physical tile changes. */
+static void invalidate_background_variants(void)
+{
+    for (unsigned slot = 0; slot < BACKGROUND_TILE_SLOTS; ++slot) {
+        unsigned tile = background_tile_keys[slot] & 0x3ff;
+        if (tile < TILE_COUNT && tile_changed[tile]) {
+            background_tile_keys[slot] = UINT16_MAX;
+        }
+    }
+}
+
 static const uint8_t *background_tile(unsigned bank, unsigned tile, uint8_t attributes)
 {
     uint8_t variant = attributes & (PRIORITY | X_FLIP | 7);
@@ -508,7 +517,6 @@ static void rebuild_background(void)
         memset(background_pixels, WHITE_INDEX, BACKGROUND_BYTES);
         return;
     }
-    memset(background_tile_keys, 0xff, sizeof background_tile_keys);
     int window_x = (int)gb_wx - 7;
     bool window = (gb_lcdc & WINDOW_ENABLE) && gb_wy < GB_SCREEN_HEIGHT && window_x < GB_SCREEN_WIDTH;
     unsigned top = window ? gb_wy : GB_SCREEN_HEIGHT;
@@ -548,7 +556,6 @@ static bool scroll_background(const uint8_t state[6])
                 background_pixels + (source_y + row) * GB_SCREEN_WIDTH + source_x, width);
     }
     unsigned map = gb_lcdc & BG_MAP ? 0x1c00 : 0x1800;
-    memset(background_tile_keys, 0xff, sizeof background_tile_keys);
     if (background_vram_dirty) {
         incremental_background = true;
         background_region(x, y, width, height, gb_scx + x, gb_scy + y, map);
@@ -595,6 +602,7 @@ void gb_present_frame(void)
     if (!frame_active) {
         /* TI-OS or another screen owner may have reused the entire LCD RAM. */
         memset(tile_valid, 0, TILE_COUNT);
+        memset(background_tile_keys, 0xff, sizeof background_tile_keys);
         background_valid = false;
         saved_control = lcd_Control;
         saved_base = lcd_UpBase;
@@ -615,6 +623,7 @@ void gb_present_frame(void)
     background_start = GB_SCREEN_HEIGHT;
     background_end = 0;
     if (gb_video_dirty || !background_valid) {
+        if (background_vram_dirty) invalidate_background_variants();
         uint8_t state[] = {gb_cgb, gb_lcdc, gb_scx, gb_scy, gb_wx, gb_wy};
         bool scrolled = scroll_background(state);
         if (!scrolled) {

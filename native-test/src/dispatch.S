@@ -146,6 +146,7 @@ _gb_write_indirect:
     .section .text.gb_native_flags
     .global _gb_native_flags
     .global _gb_native_step_flags
+    .global _gb_native_bit_flags
 _gb_native_flags:
     push af
     pop de
@@ -170,7 +171,23 @@ _gb_native_step_flags:
     and a, 0x10
     or a, c
     ld (_gb_f), a
-    ld a, d
+    push de
+    pop af
+    ret
+
+_gb_native_bit_flags:
+    push af
+    pop de
+    ld a, (_gb_f)
+    and a, 0x10
+    or a, 0x20
+    bit 6, e
+    jr z, .Lbit_not_zero
+    or a, 0x80
+.Lbit_not_zero:
+    ld (_gb_f), a
+    push de
+    pop af
     ret
 
     .global _gb_native_add16_flags
