@@ -15,6 +15,7 @@ enum {
 };
 
 uint8_t gb_oam[GB_OAM_SIZE];
+uint8_t gb_video_dirty;
 static uint8_t palettes[2][PALETTE_SIZE];
 static uint8_t palette_indexes[2];
 static uint8_t bgp, obp0, obp1, obj_x_priority;
@@ -48,7 +49,7 @@ uint8_t gb_video_read(uint8_t offset)
 static void write_palette(unsigned group, uint8_t value)
 {
     uint8_t index = palette_indexes[group];
-    palettes[group][index & 0x3f] = value;
+    gb_video_store(&palettes[group][index & 0x3f], value);
     if (index & 0x80) {
         palette_indexes[group] = 0x80 | ((index + 1) & 0x3f);
     }
@@ -57,9 +58,9 @@ static void write_palette(unsigned group, uint8_t value)
 void gb_video_write(uint8_t offset, uint8_t value)
 {
     switch (offset) {
-    case 0x47: bgp = value; return;
-    case 0x48: obp0 = value; return;
-    case 0x49: obp1 = value; return;
+    case 0x47: gb_video_store(&bgp, value); return;
+    case 0x48: gb_video_store(&obp0, value); return;
+    case 0x49: gb_video_store(&obp1, value); return;
     default: break;
     }
     if (!gb_cgb) {
@@ -70,7 +71,7 @@ void gb_video_write(uint8_t offset, uint8_t value)
     case OBPI: palette_indexes[OBJ_PALETTE] = value & 0xbf; break;
     case BGPD: write_palette(BG_PALETTE, value); break;
     case OBPD: write_palette(OBJ_PALETTE, value); break;
-    case OPRI: obj_x_priority = value & 1; break;
+    case OPRI: gb_video_store(&obj_x_priority, value & 1); break;
     default: break;
     }
 }
@@ -137,10 +138,15 @@ static void render_background(uint8_t y, uint16_t *pixels, uint8_t *background)
         if (end > GB_SCREEN_WIDTH) {
             end = GB_SCREEN_WIDTH;
         }
-        for (; x < end; ++x, ++column) {
-            uint8_t color = tile_pixel(tile_row, column, attributes);
-            background[x] = color | (attributes & PRIORITY);
-            pixels[x] = colors[attributes & 7][color];
+        const uint16_t *palette = colors[attributes & 7];
+        uint8_t priority = attributes & PRIORITY;
+        bool flip = attributes & X_FLIP;
+        uint8_t mask = flip ? 1 << column : 0x80 >> column;
+        for (; x < end; ++x) {
+            uint8_t color = ((tile_row[0] & mask) != 0) | (((tile_row[1] & mask) != 0) << 1);
+            background[x] = color | priority;
+            pixels[x] = palette[color];
+            mask = flip ? mask << 1 : mask >> 1;
         }
     }
 }
@@ -223,21 +229,25 @@ static uint24_t saved_control, saved_base;
 
 void gb_present_frame(void)
 {
+    if (frame_active && !gb_video_dirty) {
+        return;
+    }
     if (!frame_active) {
         saved_control = lcd_Control;
         saved_base = lcd_UpBase;
         frame_active = true;
+        lcd_Control = (saved_control & ~(LCD_PIXEL_FORMAT | LCD_PIXEL_ORDER)) | LCD_RGB565;
+        lcd_UpBase = (uint24_t)lcd_Ram;
+        memset(lcd_Ram, 0, LCD_SIZE);
     }
 
-    lcd_Control = (saved_control & ~(LCD_PIXEL_FORMAT | LCD_PIXEL_ORDER)) | LCD_RGB565;
-    lcd_UpBase = (uint24_t)lcd_Ram;
-    memset(lcd_Ram, 0, LCD_SIZE);
     uint16_t *line = (uint16_t *)lcd_Ram + (LCD_HEIGHT - GB_SCREEN_HEIGHT) / 2 * LCD_WIDTH
                                       + (LCD_WIDTH - GB_SCREEN_WIDTH) / 2;
     for (uint8_t y = 0; y < GB_SCREEN_HEIGHT; ++y) {
         gb_render_scanline(y, line);
         line += LCD_WIDTH;
     }
+    gb_video_dirty = 0;
 }
 
 void gb_end_frame(void)

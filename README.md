@@ -22,6 +22,8 @@ Use `--stop-at BANK:ADDRESS` to stop before executing a reachable instruction. U
 
 `--timing` enables instruction-boundary LCD and timer timing and interrupt delivery. Include interrupt vectors with `--entry`, optionally supplying the stack pointer as `BANK:ADDRESS:SP`. `--frame` displays a snapshot of the guest's background, window, and sprites on a normal stop.
 
+`--live` presents frames and reads the keypad at VBlank. Use the arrow keys for the D-pad, `2nd` for A, `Alpha` for B, `Del` for Select, `Enter` for Start, and `Clear` to exit. Live builds default to instruction-boundary timing. With `--vblank-preview`, they use the same HALT-driven frame limit as the diagnostic. `--input-after N` starts passing buttons to the guest after the first N VBlanks.
+
 `--vblank-preview [FRAMES]` is a graphics diagnostic. It advances to VBlank when the guest waits at `HALT` and displays the result after the requested number of handlers return. For routines copied to high RAM, `--ram-code START:BANK:SOURCE:LENGTH` supplies the ROM bytes used to translate and validate the executable copy. All four fields are hexadecimal.
 
 Audio support is limited to register readback and power control.

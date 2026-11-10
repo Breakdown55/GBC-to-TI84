@@ -57,6 +57,7 @@ uint8_t gb_key1;
 uint8_t gb_vbk;
 uint8_t gb_svbk;
 uint8_t gb_joyp;
+static uint8_t gb_buttons;
 uint8_t gb_sb;
 uint8_t gb_sc;
 uint8_t gb_tma;
@@ -223,6 +224,32 @@ static bool timed_register(uint8_t offset)
            offset == 0x41 || offset == 0x44 || offset == 0x45;
 }
 
+static uint8_t joypad_lines(void)
+{
+    uint8_t pressed = 0;
+    if (!(gb_joyp & 0x10)) {
+        pressed |= gb_buttons & 0x0f;
+    }
+    if (!(gb_joyp & 0x20)) {
+        pressed |= gb_buttons >> 4;
+    }
+    return pressed ^ 0x0f;
+}
+
+static void joypad_edge(uint8_t previous)
+{
+    if (previous & (uint8_t)~joypad_lines()) {
+        gb_if |= 0x10;
+    }
+}
+
+void gb_set_buttons(uint8_t buttons)
+{
+    uint8_t previous = joypad_lines();
+    gb_buttons = buttons;
+    joypad_edge(previous);
+}
+
 static uint16_t read_high(uint8_t offset)
 {
     static const uint8_t sound_read_mask[] = {
@@ -242,7 +269,7 @@ static uint16_t read_high(uint8_t offset)
     }
     switch (offset) {
     case 0x00:
-        return gb_joyp | 0xcf; /* Both button groups are released. */
+        return gb_joyp | 0xc0 | joypad_lines();
     case 0x01:
         return gb_sb;
     case 0x02:
@@ -341,7 +368,7 @@ static uint8_t transfer_oam(uint8_t page)
         bytes[i] = (uint8_t)value;
     }
     for (unsigned i = 0; i < GB_OAM_SIZE; ++i) {
-        gb_oam[i] = bytes[i];
+        gb_video_store(&gb_oam[i], bytes[i]);
     }
     gb_dma = page;
     return 1;
@@ -364,9 +391,12 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
         return 1;
     }
     switch (offset) {
-    case 0x00:
+    case 0x00: {
+        uint8_t previous = joypad_lines();
         gb_joyp = value & 0x30;
+        joypad_edge(previous);
         break;
+    }
     case 0x01:
         gb_sb = value;
         break;
@@ -403,7 +433,7 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
         }
         break;
     case 0x40:
-        gb_lcdc = value;
+        gb_video_store(&gb_lcdc, value);
         if (!(value & 0x80)) {
             gb_ly = 0;
         }
@@ -412,10 +442,10 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
         gb_stat = value & 0x78;
         break;
     case 0x42:
-        gb_scy = value;
+        gb_video_store(&gb_scy, value);
         break;
     case 0x43:
-        gb_scx = value;
+        gb_video_store(&gb_scx, value);
         break;
     case 0x44:
         break; /* LY is read-only. */
@@ -435,10 +465,10 @@ static uint8_t write_high(uint8_t offset, uint8_t value)
         gb_video_write(offset, value);
         break;
     case 0x4a:
-        gb_wy = value;
+        gb_video_store(&gb_wy, value);
         break;
     case 0x4b:
-        gb_wx = value;
+        gb_video_store(&gb_wx, value);
         break;
     case 0x4d:
         if (gb_cgb) {
@@ -643,7 +673,11 @@ static uint8_t write_memory(uint24_t address, uint8_t value)
 {
     uint8_t *byte = ram_byte(address);
     if (byte) {
-        *byte = value;
+        if (address < 0xa000 || (address >= 0xfe00 && address < 0xfe00 + GB_OAM_SIZE)) {
+            gb_video_store(byte, value);
+        } else {
+            *byte = value;
+        }
     } else if (address >= 0xa000 && address < 0xc000) {
         return write_sram(address, value);
     } else if (address >= 0xff00 && address <= 0xffff) {

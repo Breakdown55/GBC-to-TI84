@@ -6,6 +6,8 @@
 extern uint8_t gb_timing_enabled;
 extern uint8_t gb_timing_extra;
 extern uint24_t gb_frame_count;
+extern void (*gb_host_frame)(void);
+extern uint8_t gb_host_quit;
 
 void gb_timing_init(void);
 uint8_t gb_timing_flush(void);

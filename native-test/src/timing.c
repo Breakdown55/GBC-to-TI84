@@ -1,20 +1,23 @@
 #include "timing.h"
 #include "runtime.h"
+#include "render.h"
 #include "vram_dma.h"
 
 enum {
-    IRQ_VBLANK = 1, IRQ_STAT = 2, IRQ_TIMER = 4, IRQ_MASK = 0x1f,
+    IRQ_VBLANK = 1, IRQ_STAT = 2, IRQ_TIMER = 4, IRQ_JOYPAD = 0x10, IRQ_MASK = 0x1f,
     LCD_ENABLED = 0x80, VISIBLE_LINES = 144, TOTAL_LINES = 154,
     MODE_2_END = 80, MODE_3_END = 252, LINE_DOTS = 456,
     HALT_WAIT_LIMIT = LINE_DOTS * TOTAL_LINES * 4,
     HALT_MAX_STEP = 252,
     STALL_MAX_DOTS = 124,
-    DISPATCH_NONE = 0, DISPATCH_FAULT = 1, DISPATCH_HALTED = 2,
+    DISPATCH_NONE = 0, DISPATCH_FAULT = 1, DISPATCH_HALTED = 2, DISPATCH_QUIT = 3,
 };
 
 uint8_t gb_timing_enabled;
 uint8_t gb_timing_extra;
 uint24_t gb_frame_count;
+void (*gb_host_frame)(void);
+uint8_t gb_host_quit;
 
 /* The native boundary charges the last instruction before starting another. */
 static uint8_t staged_cycles;
@@ -132,6 +135,9 @@ static void advance_lcd(uint16_t dots, uint8_t fast, uint8_t halted)
             if (line == VISIBLE_LINES) {
                 ++gb_frame_count;
                 gb_if |= IRQ_VBLANK;
+                if (gb_host_frame) {
+                    gb_host_frame();
+                }
             }
         } else if (line == TOTAL_LINES - 1) {
             gb_ly = 0;
@@ -253,7 +259,7 @@ void gb_timing_write(uint8_t offset, uint8_t value)
     }
     case 0x40: {
         uint8_t previous = gb_lcdc;
-        gb_lcdc = value;
+        gb_video_store(&gb_lcdc, value);
         if ((previous ^ value) & LCD_ENABLED) {
             if (!(value & LCD_ENABLED) && mode) {
                 uint8_t result = gb_vram_dma_hblank();
@@ -352,6 +358,9 @@ uint24_t gb_timing_boundary(uint24_t pc, uint24_t cycles)
     if (!gb_timing_flush()) {
         return DISPATCH_FAULT;
     }
+    if (gb_host_quit) {
+        return DISPATCH_QUIT;
+    }
     uint8_t pending = pending_interrupts();
     if (gb_ime && pending) {
         return service_interrupt(pc, pending);
@@ -364,7 +373,7 @@ uint24_t gb_timing_boundary(uint24_t pc, uint24_t cycles)
 static uint8_t halt_step(uint8_t sources, uint8_t fast)
 {
     uint16_t cycles = HALT_MAX_STEP;
-    if (sources & (IRQ_VBLANK | IRQ_STAT)) {
+    if (sources & (IRQ_VBLANK | IRQ_STAT | IRQ_JOYPAD)) {
         uint16_t lcd = (next_lcd_dot() - dot) << fast;
         if (lcd < cycles) {
             cycles = lcd;
@@ -401,9 +410,15 @@ uint24_t gb_timing_halt(uint24_t resume)
     if (!gb_timing_flush()) {
         return DISPATCH_FAULT;
     }
+    if (gb_host_quit) {
+        return DISPATCH_QUIT;
+    }
     uint8_t sources = 0;
     if (gb_lcdc & LCD_ENABLED) {
         sources |= IRQ_VBLANK;
+        if (gb_host_frame) {
+            sources |= IRQ_JOYPAD;
+        }
         if ((gb_stat & 0x38) || ((gb_stat & 0x40) && gb_lyc < TOTAL_LINES)) {
             sources |= IRQ_STAT;
         }
@@ -418,11 +433,15 @@ uint24_t gb_timing_halt(uint24_t resume)
     }
     uint8_t fast = double_speed();
     /* Two double-speed LCD frames also exceed the longest timer overflow. */
-    for (uint24_t elapsed = 0; !pending && elapsed < HALT_WAIT_LIMIT;) {
+    for (uint24_t elapsed = 0; !pending && !gb_host_quit &&
+         (elapsed < HALT_WAIT_LIMIT || (sources & IRQ_JOYPAD));) {
         uint8_t cycles = halt_step(sources, fast);
         advance(cycles, fast, 1);
         elapsed += cycles;
         pending = pending_interrupts();
+    }
+    if (gb_host_quit) {
+        return DISPATCH_QUIT;
     }
     if (!pending) {
         return DISPATCH_HALTED;

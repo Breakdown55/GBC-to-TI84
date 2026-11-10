@@ -10,6 +10,15 @@ enum {
 };
 
 extern uint8_t gb_oam[GB_OAM_SIZE];
+extern uint8_t gb_video_dirty;
+
+static inline void gb_video_store(uint8_t *byte, uint8_t value)
+{
+    if (*byte != value) {
+        *byte = value;
+        gb_video_dirty = 1;
+    }
+}
 
 void gb_video_init(void);
 uint8_t gb_video_read(uint8_t offset);

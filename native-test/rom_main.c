@@ -4,8 +4,11 @@
 #include "timing.h"
 
 #include <ti/getcsc.h>
+#if GB_LIVE
+#include <keypadc.h>
+#endif
 
-enum { RUN_HALTED = 1, RUN_FAULT, RUN_MISSING_TARGET, RUN_CHECKPOINT };
+enum { RUN_HALTED = 1, RUN_FAULT, RUN_MISSING_TARGET, RUN_CHECKPOINT, RUN_USER_EXIT };
 
 extern const uint16_t rom_bank_mask;
 extern const uint16_t rom_watch_address;
@@ -43,13 +46,61 @@ void gb_checkpoint(void)
     gb_run_status = RUN_CHECKPOINT;
 }
 
+void gb_user_exit(void)
+{
+    gb_run_status = RUN_USER_EXIT;
+}
+
+#if GB_LIVE
+static void poll_buttons(void)
+{
+    kb_SetMode(MODE_2_SINGLE);
+    unsigned spins = 65535;
+    while (kb_GetMode() != MODE_0_IDLE && --spins) {
+    }
+    if (!spins) {
+        return;
+    }
+    gb_host_quit = kb_IsDown(kb_KeyClear) != 0;
+    if (gb_frame_count > GB_INPUT_AFTER) {
+        uint8_t buttons = 0;
+        buttons |= kb_IsDown(kb_KeyRight) ? 1 : 0;
+        buttons |= kb_IsDown(kb_KeyLeft) ? 2 : 0;
+        buttons |= kb_IsDown(kb_KeyUp) ? 4 : 0;
+        buttons |= kb_IsDown(kb_KeyDown) ? 8 : 0;
+        buttons |= kb_IsDown(kb_Key2nd) ? 0x10 : 0;
+        buttons |= kb_IsDown(kb_KeyAlpha) ? 0x20 : 0;
+        buttons |= kb_IsDown(kb_KeyDel) ? 0x40 : 0;
+        buttons |= kb_IsDown(kb_KeyEnter) ? 0x80 : 0;
+        gb_set_buttons(buttons);
+    }
+}
+
+static void live_frame(void)
+{
+    poll_buttons();
+    if (!gb_host_quit) {
+        gb_present_frame();
+    }
+}
+#endif
+
 uint8_t gb_preview_begin(uint24_t resume)
 {
-    if (preview_in_handler || !(gb_lcdc & 0x80) || !(gb_ie & 1) || !gb_ime || !gb_push_word(resume)) {
+    if (preview_in_handler || !(gb_lcdc & 0x80) || !(gb_ie & 1) || !gb_ime) {
+        return 0;
+    }
+    ++gb_frame_count;
+#if GB_LIVE
+    poll_buttons();
+    if (gb_host_quit) {
+        return 2;
+    }
+#endif
+    if (!gb_push_word(resume)) {
         return 0;
     }
     preview_in_handler = 1;
-    ++gb_frame_count;
     gb_ly = 144;
     gb_if &= (uint8_t)~1;
     gb_di();
@@ -62,6 +113,9 @@ uint8_t gb_preview_finish(void)
         return 0;
     }
     preview_in_handler = 0;
+#if GB_LIVE
+    gb_present_frame();
+#endif
     return --preview_frames_left == 0;
 }
 
@@ -92,7 +146,20 @@ int main(void)
     if (gb_timing_enabled) {
         gb_timing_init();
     }
+#if GB_LIVE
+    uint8_t keypad_config = kb_Config;
+    gb_host_frame = live_frame;
+#endif
     gb_000_0100();
+#if GB_LIVE
+    gb_host_frame = 0;
+    kb_Config = keypad_config;
+    gb_end_frame();
+    if (gb_run_status == RUN_USER_EXIT) {
+        os_ClrHome();
+        return 0;
+    }
+#endif
     if (gb_timing_enabled && !gb_timing_flush()) {
         gb_unmapped();
     }

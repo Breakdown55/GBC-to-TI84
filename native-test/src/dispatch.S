@@ -51,6 +51,8 @@ _gb_boundary:
     pop de              ; Drop the translated instruction's boundary return.
     dec a
     jp z, _gb_unmapped
+    cp a, 2
+    jp z, _gb_user_exit
     jp _gb_dispatch
 
 _gb_reti:
@@ -68,6 +70,8 @@ _gb_timed_halt:
     jp z, _gb_unmapped
     dec a
     jp z, _gb_halt
+    dec a
+    jp z, _gb_user_exit
     jp _gb_dispatch
 .Lresume:
     ex de, hl
@@ -83,6 +87,8 @@ _gb_preview_vblank:
     pop de
     or a, a
     jp z, _gb_unmapped
+    dec a
+    jp nz, _gb_user_exit
     ld hl, 0x0040
     jp _gb_dispatch
 

@@ -11,6 +11,7 @@ from translate import dispatch, lower_instruction
 
 BANK_SIZE = 0x4000
 ENTRY = 0x0100
+DEFAULT_ANALYSIS_LIMIT = 750_000
 HRAM_BASE = 0xff80
 HRAM_END = 0xffff
 VRAM_BASE = 0x8000
@@ -21,6 +22,11 @@ SRAM_BASE = 0x10000
 WRAM_BANKS_BASE = 0x30000
 VRAM_BANKS_BASE = 0x40000
 UNKNOWN_SRAM_BYTE = -1
+SOUND_BASE = 0xff10
+SOUND_POWER = 0xff26
+SOUND_READ_MASK = bytes.fromhex("80 3f 00 ff bf ff 3f 00 ff bf 7f ff 9f ff bf ff ff 00 00 bf 00 00 70")
+UNKNOWN_SOUND = (None,) * len(SOUND_READ_MASK)
+INITIAL_SOUND = (0,) * 20 + (0x77, 0xf3, 0x80)
 
 IMPLIED = {
     0x00: "nop", 0x02: "ld [bc], a", 0x03: "inc bc", 0x07: "rlca", 0x09: "add hl, bc",
@@ -128,6 +134,12 @@ EMPTY_MEMORY = KnownMemory()
 
 
 @dataclass(frozen=True)
+class SavedFlags:
+    zero: Optional[bool]
+    carry: Optional[bool]
+
+
+@dataclass(frozen=True)
 class State:
     pc: int
     bank: int
@@ -156,6 +168,8 @@ class State:
     vram: KnownMemory = EMPTY_MEMORY
     preview_remaining: int = 0
     preview_interrupt: bool = False
+    joypad_delay: Optional[int] = None
+    sound: tuple = UNKNOWN_SOUND
 
 
 def word_bytes(word):
@@ -188,6 +202,23 @@ def register_byte(state, register):
         return getattr(state, register)
     pair, high = {"d": ("de", 1), "e": ("de", 0), "h": ("hl", 1), "l": ("hl", 0)}[register]
     return getattr(state, pair)[high]
+
+
+def sound_after_store(sound, address, value):
+    power = sound[-1]
+    if address == SOUND_POWER:
+        if value is None:
+            return UNKNOWN_SOUND
+        return (*sound[:-1], 0x80) if value & 0x80 else (0,) * len(sound)
+    if power == 0:
+        return sound
+    index = address - SOUND_BASE
+    mask = SOUND_READ_MASK[index]
+    if value is not None:
+        value &= ~mask
+    if power is None and sound[index] != value:
+        value = None
+    return (*sound[:index], value, *sound[index + 1:])
 
 
 def load_register(state, register, value):
@@ -456,8 +487,12 @@ class Cartridge:
         return remember_byte(memory, address, value)
 
     def stack_byte(self, state, offset):
-        if offset < len(state.stack) and state.stack[-1 - offset] is not None:
-            return state.stack[-1 - offset]
+        if offset < len(state.stack):
+            value = state.stack[-1 - offset]
+            if isinstance(value, SavedFlags):
+                return None
+            if value is not None:
+                return value
         if state.sp is None:
             return None
         address = (state.sp + offset) & 0xffff
@@ -478,7 +513,14 @@ class Cartridge:
             rom_bytes.add((bank, address))
             return self.data[bank * BANK_SIZE + address % BANK_SIZE]
         if address == 0xff00:
-            return None if state.joyp is None else state.joyp | 0xcf
+            if state.joyp is None or (state.joypad_delay == 0 and state.joyp != 0x30):
+                return None
+            return state.joyp | 0xcf
+        if SOUND_BASE <= address <= SOUND_POWER:
+            index = address - SOUND_BASE
+            mask = SOUND_READ_MASK[index]
+            value = state.sound[index]
+            return mask if mask == 0xff else None if value is None else value | mask
         if VRAM_BASE <= address < VRAM_BASE + VRAM_SIZE:
             if state.hdma_async:
                 return None
@@ -576,6 +618,7 @@ class Cartridge:
         b, c, z, carry = state.b, state.c, state.z, state.carry
         de, memory, key1, lcdc = state.de, state.memory, state.key1, state.lcdc
         joyp, ly = state.joyp, state.ly
+        sound = state.sound
         hdma_source, svbk = state.hdma_source, state.svbk
         hdma_destination, hdma_async = state.hdma_destination, state.hdma_async
         vram, vbk = state.vram, state.vbk
@@ -586,7 +629,9 @@ class Cartridge:
         if opcode == 0x76:
             if state.preview_remaining and not state.preview_interrupt:
                 word = word_bytes(next_pc)
+                delay = None if state.joypad_delay is None else max(0, state.joypad_delay - 1)
                 yield replace(next_state, pc=0x40, preview_interrupt=True, ly=144,
+                              joypad_delay=delay,
                               stack=(*stack, *reversed(word)),
                               sp=None if sp is None else (sp - 2) & 0xffff,
                               memory=self.push_memory(memory, sp, word, svbk))
@@ -791,6 +836,10 @@ class Cartridge:
                     ly = 0
             if address is None or address == 0xff00:
                 joyp = None if address is None or stored is None else stored & 0x30
+            if address is None:
+                sound = UNKNOWN_SOUND
+            elif SOUND_BASE <= address <= SOUND_POWER:
+                sound = sound_after_store(sound, address, stored)
             if address is None and (self.cgb or not high_only):
                 vram = EMPTY_MEMORY
             if address == 0xff46 and stored is not None and stored < 0x80:
@@ -866,7 +915,8 @@ class Cartridge:
             stack, sp = (), value if opcode == 0x31 else hl_address
         elif opcode in PUSHES:
             word = {0xc5: (c, b), 0xd5: de, 0xe5: hl, 0xf5: (None, a)}[opcode]
-            stack = (*stack, *reversed(word))
+            low, high = word
+            stack = (*stack, high, SavedFlags(z, carry) if opcode == 0xf5 else low)
             memory = self.push_memory(memory, sp, word, svbk)
             sp = None if sp is None else (sp - 2) & 0xffff
         elif opcode in POPS:
@@ -876,8 +926,13 @@ class Cartridge:
             elif opcode == 0xd1:
                 de = (low, high)
             elif opcode == 0xf1:
-                a, z = high, None if low is None else bool(low & 0x80)
-                carry = None if low is None else bool(low & 0x10)
+                a = high
+                saved = stack[-1] if stack else None
+                if isinstance(saved, SavedFlags):
+                    z, carry = saved.zero, saved.carry
+                else:
+                    z = None if low is None else bool(low & 0x80)
+                    carry = None if low is None else bool(low & 0x10)
             else:
                 c, b = low, high
             stack = stack[:-2]
@@ -885,23 +940,27 @@ class Cartridge:
         for bank in sorted(banks):
             yield replace(next_state, bank=bank, a=a, hl=hl, stack=stack, sp=sp,
                           b=b, c=c, z=z, carry=carry, de=de, memory=memory, key1=key1, lcdc=lcdc,
-                          joyp=joyp, ly=ly,
+                          joyp=joyp, ly=ly, sound=sound,
                           hdma_source=hdma_source, sram_enabled=sram_enabled, sram_bank=sram_bank,
                           sram_erased=sram_erased, svbk=svbk, vbk=vbk, vram=vram,
                           hdma_destination=hdma_destination, hdma_async=hdma_async)
 
     def discover(self, extra_entries=(), stop_at=None, rom_bytes=None, *, timing=False,
-                 trap_unsupported=False, vblank_preview=False, dispatch_targets=None):
+                 trap_unsupported=False, vblank_preview=False, dispatch_targets=None,
+                 input_after=None, analysis_limit=DEFAULT_ANALYSIS_LIMIT):
         if not isinstance(vblank_preview, int) or not 0 <= vblank_preview <= 0xffffff:
             raise ValueError("VBlank preview frame count must fit in an unsigned 24-bit integer")
         if timing and vblank_preview:
             raise ValueError("VBlank preview and timed execution are mutually exclusive")
+        delay = None
+        if input_after is not None:
+            delay = input_after + 1 if vblank_preview else 0
         entry_a = 0x11 if self.cgb else 0x01
         work = deque([State(ENTRY, 1, entry_a, sp=0xfffe, key1=0 if self.cgb else None, lcdc=0x91,
                             sram_enabled=False, sram_bank=0, sram_erased=True, svbk=0,
                             vbk=0, hdma_source=(0, 0), hdma_destination=(0, 0),
-                            joyp=0, ly=None if timing else 0,
-                            preview_remaining=int(vblank_preview))])
+                            joyp=0, ly=None if timing else 0, sound=INITIAL_SOUND,
+                            preview_remaining=int(vblank_preview), joypad_delay=delay)])
         if rom_bytes is None:
             rom_bytes = set()
         if stop_at is not None:
@@ -918,7 +977,8 @@ class Cartridge:
                 raise ValueError("extra entry stack pointer is outside the guest address space")
             entry = State(pc, bank, sp=stack_pointer[0] if stack_pointer else None,
                           vbk=None if self.cgb else 0, hdma_async=timing and self.cgb,
-                          preview_remaining=int(vblank_preview))
+                          preview_remaining=int(vblank_preview),
+                          joypad_delay=None if input_after is None else 0)
             if dispatch_targets is not None:
                 dispatch_targets.add(address_key(entry))
             work.append(entry)
@@ -933,8 +993,10 @@ class Cartridge:
             bank, _ = address_key(state)
             location = f"${bank:03X}:${state.pc:04X}"
             try:
-                if len(seen) > 750_000 or len(state.stack) > 512:
-                    raise ValueError("static analysis exceeded its state or call-depth limit")
+                if len(seen) > analysis_limit:
+                    raise ValueError(f"static analysis exceeded {analysis_limit:,} states")
+                if len(state.stack) > 512:
+                    raise ValueError("static analysis exceeded its stack limit")
                 if not 0 <= state.pc < 0x8000 and state.pc not in self.ram_code:
                     raise ValueError("control transfer outside cartridge ROM or registered RAM code")
                 key = bank, state.pc
@@ -1040,8 +1102,31 @@ def checked_helper_stubs(helpers):
     return assembly
 
 
+def outline_repeated(assembly, repeated):
+    """Share repeated native instruction bodies that return to their caller."""
+    replacements = {}
+    for body, offsets in repeated.items():
+        # Absolute guest-state loads/stores and ADL calls take at least four bytes.
+        minimum = sum(4 if "_gb_" in line or line.startswith("call ") else 1
+                      for line in body if not line.endswith(":"))
+        if (minimum - 4) * len(offsets) <= minimum + 1:
+            continue
+        label = f".Lshared_{offsets[0]}"
+        for offset in offsets:
+            replacements[offset] = (f"    call {label}", len(body))
+        assembly.extend(["", f"{label}:", *(f"    {line}" for line in body), "    ret"])
+    result = []
+    index = 0
+    while index < len(assembly):
+        line, count = replacements.get(index, (assembly[index], 1))
+        result.append(line)
+        index += count
+    return result
+
+
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
-                trap_unsupported=False, ram_code=(), vblank_preview=False):
+                trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
+                analysis_limit=DEFAULT_ANALYSIS_LIMIT):
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
                               0xc000 <= watch_address < 0xe000 or
                               0xff80 <= watch_address <= 0xfffe):
@@ -1051,11 +1136,13 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     dispatch_targets = set() if vblank_preview else None
     instructions = cartridge.discover(extra_entries, stop_at, rom_bytes, timing=timing,
                                       trap_unsupported=trap_unsupported, vblank_preview=vblank_preview,
-                                      dispatch_targets=dispatch_targets)
+                                      dispatch_targets=dispatch_targets, input_after=input_after,
+                                      analysis_limit=analysis_limit)
     assembly = ["    .assume ADL=1", "    .section .text"]
     targets = ['#include "runtime.h"', ""]
     fallback_addresses = set()
     helpers = set()
+    repeated = {}
     ordered = sorted(instructions.items())
     for (bank, pc), instruction in ordered:
         name = symbol(bank, pc)
@@ -1103,6 +1190,10 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         else:
             native, size = lower_instruction(instruction.text, pc, timing=timing,
                                              live_immediate=live_immediate, vblank_preview=vblank_preview)
+        # Blocks that can jump out on a fault must keep the original native stack.
+        if (vblank_preview and size is not None and not checked and not in_ram and len(native) > 1
+                and not any(line.startswith(("jp ", "ret", "djnz ")) for line in native)):
+            repeated.setdefault(tuple(native), []).append(len(assembly))
         assembly.extend(f"    {line}" for line in native)
         if size is not None:
             next_pc = pc + size
@@ -1112,6 +1203,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 fallback_addresses.add(next_pc)
                 assembly.extend(f"    {line}" for line in dispatch(next_pc))
     assembly.extend(checked_helper_stubs(helpers))
+    if repeated:
+        assembly = outline_repeated(assembly, repeated)
     entries = []
     target_banks = []
     for (bank, pc), instruction in ordered:

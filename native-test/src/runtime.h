@@ -92,6 +92,7 @@ void gb_alu(uint8_t operation, uint8_t operand);
 uint8_t gb_alu_hl(uint8_t operation);
 uint8_t gb_read_high(uint8_t offset);
 uint8_t gb_write_high(uint8_t offset);
+void gb_set_buttons(uint8_t buttons);
 uint8_t gb_watch_ram(uint16_t address);
 uint8_t gb_stop(void);
 uint8_t gb_load_hli(void);

@@ -1,5 +1,6 @@
 #include "vram_dma.h"
 #include "runtime.h"
+#include "render.h"
 #include "timing.h"
 
 enum { BLOCK_SIZE = 16, HBLANK_MODE = 0x80 };
@@ -42,7 +43,7 @@ static uint8_t transfer(unsigned length)
     }
     uint8_t *bytes = &gb_vram[gb_vbk][destination];
     for (unsigned i = 0; i < length; ++i) {
-        bytes[i] = (uint8_t)gb_read_byte(source + i);
+        gb_video_store(&bytes[i], (uint8_t)gb_read_byte(source + i));
     }
     source = source_end;
     destination = destination_end;

@@ -334,6 +334,41 @@ class RomTest(unittest.TestCase):
         self.assertEqual(assembly.count("jp _gb_preview_vblank"), 2)
         self.assertIn("rom_preview_frames = 2", multiple)
 
+    def test_preview_shares_repeated_native_bodies(self):
+        data = cartridge_image()
+        data[0x100:0x106] = bytes.fromhex("06 05 78 78 78 76")
+        assembly, _ = compile_rom(data, stop_at=(0, 0x105), vblank_preview=1)
+        self.assertEqual(assembly.count("call .Lshared_"), 3)
+        self.assertIn("ld a, (_gb_bc+1)\n    ld (_gb_a), a\n    ret", assembly)
+
+    def test_live_input_keeps_the_pressed_branch_after_the_delay(self):
+        data, (_, resume) = frame_rom()
+        # Select buttons, then skip the marker write when A is released.
+        data[0x40:0x50] = bytes.fromhex("3e 10 e0 00 f0 00 e6 01 20 05 3e a5 ea 23 c1 d9")
+        data[resume] = 0x76
+        cartridge = Cartridge(data)
+        self.assertNotIn((0, 0x4a), cartridge.discover(vblank_preview=1, input_after=1))
+        self.assertIn((0, 0x4a), cartridge.discover(vblank_preview=2, input_after=1))
+
+    def test_sound_register_readback_follows_power_and_read_masks(self):
+        data = cartridge_image()
+        code = bytes.fromhex(
+            "3e 80 e0 11 f0 11 fe bf 20 10"  # Read written bits with the mask applied.
+            " af e0 26 3e 80 e0 11 f0 11 fe 3f 20 03"  # Power off resets and blocks writes.
+            " 76 00 00 d3"
+        )
+        data[0x100:0x100 + len(code)] = code
+        instructions = Cartridge(data).discover()
+        self.assertIn((0, 0x117), instructions)
+
+    def test_push_and_pop_af_preserve_known_flags(self):
+        data = cartridge_image()
+        # INC makes Z known while carry is still unknown. Restore Z after XOR changes it.
+        code = bytes.fromhex("31 00 d0 3e 00 3c f5 af f1 28 01 76 d3")
+        data[0x100:0x100 + len(code)] = code
+        instructions = Cartridge(data).discover()
+        self.assertIn((0, 0x10b), instructions)
+
     def test_tilemap_preview_retains_banked_tile_data(self):
         assembly, targets = compile_rom(tilemap_rom(), vblank_preview=1)
         self.assertIn("jp _gb_preview_reti", assembly)

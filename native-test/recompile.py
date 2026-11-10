@@ -9,7 +9,7 @@ import struct
 import subprocess
 import tempfile
 
-from rom import compile_rom
+from rom import DEFAULT_ANALYSIS_LIMIT, compile_rom
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -72,7 +72,7 @@ def guard_compressed_program(run, work):
     path.write_bytes(program)
 
 
-def build(ce, work, name, show_frame=False):
+def build(ce, work, name, show_frame=False, input_after=None):
     def run(tool, *args):
         subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
 
@@ -97,7 +97,8 @@ def build(ce, work, name, show_frame=False):
     for unit, source in sources:
         run(clang, "-S", "-Oz", "-Wall", "-Wextra", "-fno-addrsig",
             "-ffunction-sections", "-fdata-sections", "-mllvm", "-z80-gas-style",
-            "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}", "-nostdinc",
+            "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}",
+            f"-DGB_LIVE={int(input_after is not None)}", f"-DGB_INPUT_AFTER={input_after or 0}", "-nostdinc",
             "-isystem", ce / "include", "-I", PROJECT / "src",
             source, "-o", f"{unit}.s")
         run(assembler, "-march=ez80+full", f"{unit}.s", "-o", f"{unit}.o")
@@ -175,10 +176,14 @@ def main():
     clock.add_argument("--vblank-preview", nargs="?", type=int, const=1, default=None, metavar="FRAMES",
                        help="serve this many VBlank interrupts at HALT and show the result (default: 1)")
     parser.add_argument("--frame", action="store_true", help="show the guest display on a normal stop")
+    parser.add_argument("--live", action="store_true", help="update the display and read keys at VBlank")
+    parser.add_argument("--input-after", type=int, help="wait this many VBlanks before accepting guest buttons")
     parser.add_argument("--ram-code", type=parse_ram_code, action="append", default=[],
                         help="translate code copied into HRAM from ROM, as START:BANK:SOURCE:LENGTH")
     parser.add_argument("--trap-unsupported", action="store_true",
                         help="build with runtime faults for unsupported opcodes")
+    parser.add_argument("--analysis-limit", type=int, default=DEFAULT_ANALYSIS_LIMIT,
+                        help="maximum number of analysis states (default: %(default)s)")
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
@@ -189,20 +194,27 @@ def main():
         parser.error("the .8xp and .map outputs must be separate from the input")
     if args.watch == 0:
         parser.error("--watch must be a VRAM, WRAM, or HRAM address")
+    if args.analysis_limit < 1:
+        parser.error("--analysis-limit must be positive")
     if args.vblank_preview is not None and not 1 <= args.vblank_preview <= 0xffffff:
         parser.error("--vblank-preview expects a positive 24-bit frame count")
     preview_frames = args.vblank_preview or 0
+    if args.input_after is not None and (not args.live or not 0 <= args.input_after < 0xffffff):
+        parser.error("--input-after requires --live and a frame count from 0 to 16777214")
+    input_after = (args.input_after or 0) if args.live else None
+    timing = args.timing or (args.live and not preview_frames)
     try:
         assembly, table = compile_rom(args.rom.read_bytes(), args.entry, args.watch or 0, args.stop_at,
-                                      timing=args.timing, trap_unsupported=args.trap_unsupported,
-                                      ram_code=args.ram_code, vblank_preview=preview_frames)
+                                      timing=timing, trap_unsupported=args.trap_unsupported,
+                                      ram_code=args.ram_code, vblank_preview=preview_frames,
+                                      input_after=input_after, analysis_limit=args.analysis_limit)
         ce = toolchain_path(args.cedev)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="gbc-build-", dir=output.parent) as directory:
             work = Path(directory)
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
-            archived = build(ce, work, args.name, args.frame or bool(preview_frames))
+            archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after)
             os.replace(work / "program.8xp", output)
             os.replace(work / "program.map", output.with_suffix(".map"))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
