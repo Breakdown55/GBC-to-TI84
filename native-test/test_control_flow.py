@@ -14,6 +14,18 @@ def cartridge():
 
 
 class BranchDiscoveryTest(unittest.TestCase):
+    def test_banked_callback_rule_only_applies_in_its_bank(self):
+        data = cartridge()
+        for bank in (1, 3):
+            base = bank * BANK_SIZE
+            data[base:base + 7] = bytes.fromhex("21 20 40 cd 10 40 c9")
+            data[base + 0x10] = data[base + 0x20] = 0xc9
+        instructions = {}
+        discover_branches(Cartridge(data), [(1, 0x4000), (3, 0x4000)], instructions, set(), set(),
+                          callback_calls={(3, 0x4010): "hl"})
+        self.assertNotIn((1, 0x4020), instructions)
+        self.assertIn((3, 0x4020), instructions)
+
     def test_tail_dispatch_with_pushed_return_address_keeps_continuation(self):
         data = cartridge()
         data[0x4000:0x400e] = bytes.fromhex("21 0d 40 e5 fa 00 c0 b7 c2 20 40 18 13 c9")

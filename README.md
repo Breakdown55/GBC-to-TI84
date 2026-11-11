@@ -36,7 +36,7 @@ Fallback execution is slower than native code and requires every generated ROM A
 
 Repeat `--branch-entry BANK:ADDRESS` to follow both outcomes of direct branches beyond the simulated path. The branch walker recognizes closed inline jump tables and follows constant register jumps. For cartridge calling conventions, `--inline-call VECTOR:LENGTH` describes parameter bytes after a call, with optional `:BANK_OFFSET:INDEX_OFFSET:TABLE_BASE` fields for an indexed far call. Use `--callback-call ADDRESS:hl` (or `:de` or `:bc`) for a routine that receives a code pointer in a register. Addresses and offsets are hexadecimal. Unresolved destinations can still be supplied as additional entries.
 
-`--entry-table BANK:ADDRESS:COUNT` reads a declared table of 16-bit code pointers and follows each destination. Use it for computed dispatch when the table's bounds are known but static analysis cannot determine the index.
+`--entry-table BANK:ADDRESS:COUNT` reads a declared table of 16-bit code pointers and follows each destination. Use it for computed dispatch when the table's bounds are known but static analysis cannot determine the index. Qualify a callback as `--callback-call BANK:ADDRESS:hl` when its routine is in a switchable ROM bank.
 
 `--frame-skip 1` presents every other guest frame while keeping input polling and guest interrupts on every frame. At full guest speed this corresponds to about 30 presentations per second. Frame skipping alone does not make guest execution real-time.
 

@@ -222,10 +222,11 @@ def parse_inline_call(text):
 
 
 def parse_callback_call(text):
-    match = re.fullmatch(r"([0-9a-fA-F]{1,4}):(hl|de|bc)", text)
+    match = re.fullmatch(r"(?:([0-9a-fA-F]{1,3}):)?([0-9a-fA-F]{1,4}):(hl|de|bc)", text)
     if match is None:
-        raise argparse.ArgumentTypeError("expected hexadecimal ADDRESS:hl, ADDRESS:de or ADDRESS:bc")
-    return int(match[1], 16), match[2]
+        raise argparse.ArgumentTypeError("expected hexadecimal [BANK:]ADDRESS:hl (or :de or :bc)")
+    address = int(match[2], 16)
+    return ((int(match[1], 16), address) if match[1] else address), match[3]
 
 
 def main():
@@ -249,7 +250,7 @@ def main():
     parser.add_argument("--inline-call", type=parse_inline_call, action="append", default=[],
                         help="cartridge call format VECTOR:LENGTH[:BANK_OFFSET:INDEX_OFFSET:TABLE_BASE] in hex")
     parser.add_argument("--callback-call", type=parse_callback_call, action="append", default=[],
-                        help="function receiving a code pointer, as hexadecimal ADDRESS:hl (or :de or :bc)")
+                        help="function receiving a code pointer, as hexadecimal [BANK:]ADDRESS:hl (or :de or :bc)")
     parser.add_argument("--stop-at", type=parse_entry,
                         help="stop before executing this hexadecimal BANK:ADDRESS")
     clock = parser.add_mutually_exclusive_group()

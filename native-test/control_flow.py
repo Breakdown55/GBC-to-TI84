@@ -193,8 +193,10 @@ def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targ
         opcode = instruction.opcode
         following = pc + instruction.size
         call = opcode in (0xcd, *CONDITIONAL_CALL) or opcode & 0xc7 == 0xc7
-        if call and instruction.operand in callback_calls:
-            pair = callback_calls[instruction.operand]
+        callback = instruction.operand
+        callee_bank = bank if BANK_SIZE <= callback < 0x8000 else 0
+        pair = callback_calls.get((callee_bank, callback), callback_calls.get(callback)) if call else None
+        if pair is not None:
             high, low = {"bc": (1, 2), "de": (3, 4), "hl": (5, 6)}[pair]
             target = join_word(registers[low], registers[high])
             if target is not None:
