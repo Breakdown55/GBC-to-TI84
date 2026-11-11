@@ -125,6 +125,17 @@ class BranchDiscoveryTest(unittest.TestCase):
                 self.assertNotIn((1, address), instructions)
                 self.assertIn((1, address), rom_bytes)
 
+    def test_declared_inline_table_can_end_before_its_first_destination(self):
+        data = cartridge()
+        data[0:3] = bytes.fromhex("c3 00 03")
+        data[0x300:0x30b] = bytes.fromhex("87 e1 85 6f 30 01 24 2a 66 6f e9")
+        data[0x4000:0x4005] = bytes.fromhex("c7 10 40 20 40")
+        data[0x4010] = data[0x4020] = 0xc9
+        assembly, _ = compile_rom(data, branch_entries=[(1, 0x4000)], entry_tables=[(1, 0x4001, 2)])
+        self.assertIn("_gb_001_4010:", assembly)
+        self.assertIn("_gb_001_4020:", assembly)
+        self.assertNotIn("_gb_001_4001:", assembly)
+
     def test_overlapping_entries_do_not_change_normal_fallthrough(self):
         data = cartridge()
         data[0x100:0x103] = bytes.fromhex("c3 50 01")

@@ -27,13 +27,15 @@ class InlineCallFormat:
                 raise ValueError("invalid indexed inline call format")
 
 
-def inline_jump_table(cartridge, bank, vector, start):
+def inline_jump_table(cartridge, bank, vector, start, count=None):
     """Recognize a tail dispatcher that indexes words after its saved return PC."""
     if not 0 <= start < 0x7ffd:
         return None
     window = 0 if start < BANK_SIZE else bank
     limit = (start // BANK_SIZE + 1) * BANK_SIZE
-    end = limit
+    end = start + count * 2 if count is not None else limit
+    if end > limit or count is not None and not 1 <= count <= 128:
+        return None
     cursor = start
     targets = []
     while cursor + 2 <= end and len(targets) < 128:
@@ -43,11 +45,13 @@ def inline_jump_table(cartridge, bank, vector, start):
             break
         targets.append(target)
         cursor += 2
-        if cursor <= target < end:
+        if count is None and cursor <= target < end:
             end = target
     # Require a pointer to the first byte after the table. Without that bound,
     # words in the adjacent code or data cannot safely be treated as entries.
-    if len(targets) < 2 or cursor != end or end == limit:
+    if cursor != end or (count is None and (len(targets) < 2 or end == limit)):
+        return None
+    if any(start <= target < end for target in targets):
         return None
     for index in range(len(targets)):
         state = State(vector, bank, a=index, stack=(start >> 8, start & 255))
@@ -122,7 +126,7 @@ def tail_return(instructions, bank, pc):
 
 
 def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targets,
-                      inline_calls=None, *, callback_calls=None, limit=100000, stop_at=None):
+                      inline_calls=None, *, callback_calls=None, entry_tables=(), limit=100000, stop_at=None):
     """Add both outcomes of branches and the continuations of calls.
 
     Inline call layouts describe the cartridge's calling convention. Unresolved
@@ -144,6 +148,7 @@ def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targ
     visited = set()
     outside = set()
     tables = {}
+    table_counts = {(bank if start >= BANK_SIZE else 0, start): count for bank, start, count in entry_tables}
     added = 0
 
     def retain(bank, address, size):
@@ -206,7 +211,10 @@ def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targ
         if layout is None and opcode >= 0 and opcode & 0xc7 == 0xc7:
             table_key = bank, pc
             if table_key not in tables:
-                tables[table_key] = inline_jump_table(cartridge, bank, instruction.operand, following)
+                tables[table_key] = inline_jump_table(
+                    cartridge, bank, instruction.operand, following,
+                    table_counts.get((bank if following >= BANK_SIZE else 0, following)),
+                )
             table = tables[table_key]
         if table is not None:
             retain(bank, following, len(table) * 2)

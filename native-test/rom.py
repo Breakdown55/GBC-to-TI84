@@ -1477,7 +1477,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         from control_flow import discover_branches, read_entry_tables
         branch_entries = (*branch_entries, *read_entry_tables(cartridge, entry_tables, rom_bytes))
         discover_branches(cartridge, branch_entries, instructions, rom_bytes, dispatch_targets,
-                          inline_calls, callback_calls=callback_calls, stop_at=stop_at)
+                          inline_calls, callback_calls=callback_calls, entry_tables=entry_tables, stop_at=stop_at)
     if fallback_banks:
         instructions = {key: value for key, value in instructions.items() if key[0] not in fallback_banks}
     if retained is not None:
