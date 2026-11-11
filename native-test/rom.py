@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from itertools import groupby
 from typing import Optional
+from native_overlays import region_key
 
 from translate import (BYTE_REGISTERS, dispatch, forward_native_flags, lower_instruction,
                        native_entries, omit_dead_flag_updates, reuse_native_registers)
@@ -34,7 +35,7 @@ IMPLIED = {
     0x0a: "ld a, [bc]", 0x0b: "dec bc", 0x0f: "rrca",
     0x12: "ld [de], a", 0x13: "inc de", 0x17: "rla", 0x19: "add hl, de", 0x1a: "ld a, [de]",
     0x1b: "dec de", 0x1f: "rra", 0x22: "ld [hl+], a", 0x23: "inc hl",
-    0x29: "add hl, hl", 0x2a: "ld a, [hl+]", 0x2b: "dec hl", 0x2f: "cpl",
+    0x27: "daa", 0x29: "add hl, hl", 0x2a: "ld a, [hl+]", 0x2b: "dec hl", 0x2f: "cpl",
     0x32: "ld [hl-], a", 0x33: "inc sp", 0x37: "scf", 0x39: "add hl, sp",
     0x3a: "ld a, [hl-]", 0x3b: "dec sp", 0x3f: "ccf",
     0x76: "halt",
@@ -50,6 +51,7 @@ BYTE_OPERAND = {
     0xe0: "ldh [$ff{:02x}], a", 0xf0: "ldh a, [$ff{:02x}]",
 }
 WORD_OPERAND = {
+    0x08: "ld [${:04x}], sp",
     0x01: "ld bc, ${:04x}", 0x11: "ld de, ${:04x}", 0x21: "ld hl, ${:04x}",
     0x31: "ld sp, ${:04x}", 0xc2: "jp nz, ${:04x}", 0xc3: "jp ${:04x}",
     0xc4: "call nz, ${:04x}", 0xca: "jp z, ${:04x}", 0xcc: "call z, ${:04x}",
@@ -63,7 +65,7 @@ REGISTERS = ("b", "c", "d", "e", "h", "l", "[hl]", "a")
 IMMEDIATE_LOADS = {0x06: "b", 0x0e: "c", 0x16: "d", 0x1e: "e", 0x26: "h", 0x2e: "l", 0x3e: "a"}
 HL_STORES = (0x22, 0x32, 0x36, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x77)
 HL_LOADS = (0x2a, 0x3a, 0x46, 0x4e, 0x56, 0x5e, 0x66, 0x6e, 0x7e)
-MEMORY_STORES = (*HL_STORES, 0x02, 0x12, 0xea)
+MEMORY_STORES = (*HL_STORES, 0x02, 0x08, 0x12, 0xea)
 MEMORY_LOADS = (*HL_LOADS, 0x0a, 0x1a, 0xf2, 0xfa)
 PUSHES = (0xc5, 0xd5, 0xe5, 0xf5)
 POPS = (0xc1, 0xd1, 0xe1, 0xf1)
@@ -108,6 +110,8 @@ class Instruction:
 
     def tcycles(self):
         opcode = self.opcode
+        if opcode == 0x08:
+            return 20
         if opcode == 0xcb:
             if self.operand & 7 == 6:
                 return 12 if 0x40 <= self.operand < 0x80 else 16
@@ -683,6 +687,20 @@ class Cartridge:
         hl_address = join_word(*hl)
         de_address = join_word(*de)
 
+        if opcode == 0x08:
+            states = (state,)
+            for offset, byte in enumerate(word_bytes(sp)):
+                write = Instruction(0xea, instruction.size, "", (value + offset) & 0xffff)
+                states = tuple(successor for current in states
+                               for successor in self.successors(replace(current, pc=state.pc, a=byte), write,
+                                                                rom_bytes, timing=timing))
+            yield from (replace(current, a=a) for current in states)
+            return
+        if opcode == 0x27:
+            # H and N are runtime flags and are not tracked by this analysis.
+            yield replace(next_state, a=None, z=None, carry=None)
+            return
+
         if opcode == 0x76:
             if state.preview_remaining and not state.preview_interrupt:
                 word = word_bytes(next_pc)
@@ -1190,35 +1208,41 @@ def symbol(bank, pc):
     return f"gb_{bank:03x}_{pc:04x}"
 
 
-def native_destination(bank, pc, address, instructions):
+def native_destination(bank, pc, address, instructions, native_overlays=False):
     if BANK_SIZE <= address < 2 * BANK_SIZE:
         if not BANK_SIZE <= pc < 2 * BANK_SIZE:
             return None
         key = bank, address
     else:
         key = 0, address
-    return key if key in instructions else None
+    if key not in instructions:
+        return None
+    if native_overlays:
+        region = region_key(*key)
+        if region is not None and region != region_key(bank, pc):
+            return None
+    return key
 
 
-def direct_branch(bank, pc, instruction, instructions):
+def direct_branch(bank, pc, instruction, instructions, native_overlays=False, adjacent=True):
     opcode = instruction.opcode
     if opcode not in (0x18, 0xc3, *CONDITIONAL_JR, *CONDITIONAL_JP):
         return None
 
-    taken = native_destination(bank, pc, instruction.operand, instructions)
+    taken = native_destination(bank, pc, instruction.operand, instructions, native_overlays)
     if taken is None:
         return None
     if opcode in (0x18, 0xc3):
         return [f"jp _{symbol(*taken)}"]
 
     next_pc = pc + instruction.size
-    fallthrough = native_destination(bank, pc, next_pc, instructions)
+    fallthrough = native_destination(bank, pc, next_pc, instructions, native_overlays)
     if fallthrough is None:
         return None
     flag = 4 if opcode & 0x10 else 7
     condition = "nz" if opcode & 8 else "z"
     native = ["ld a, (_gb_f)", f"bit {flag}, a", f"jp {condition}, _{symbol(*taken)}"]
-    if fallthrough != (bank, next_pc) or pc // BANK_SIZE != next_pc // BANK_SIZE:
+    if not adjacent or fallthrough != (bank, next_pc) or pc // BANK_SIZE != next_pc // BANK_SIZE:
         native.append(f"jp _{symbol(*fallthrough)}")
     return native
 
@@ -1246,10 +1270,16 @@ def checked_helper_stubs(helpers):
 OUTLINE_FAULT_BRANCHES = {f"jp {condition}, _gb_unmapped" for condition in ("z", "nz", "c", "nc")}
 
 
-def outline_repeated(assembly, repeated):
+def outline_repeated(assembly, repeated, section_local=False):
     """Share repeated native instruction bodies that return to their caller."""
     replacements = {}
     needs_fault_exit = False
+    owners = []
+    section = ".text"
+    for line in assembly:
+        if line.strip().startswith(".section "):
+            section = line.strip().split()[1].split(",")[0]
+        owners.append(section)
     for body, offsets in repeated.items():
         offsets = [offset for offset in offsets
                    if all(assembly[offset + i] == f"    {line}" for i, line in enumerate(body))]
@@ -1258,19 +1288,27 @@ def outline_repeated(assembly, repeated):
         # Absolute guest-state loads/stores and ADL calls take at least four bytes.
         minimum = sum(4 if "_gb_" in line or line.startswith("call ") else 1
                       for line in body if not line.endswith(":"))
-        if (minimum - 4) * len(offsets) <= minimum + 1:
-            continue
-        label = f".Lshared_{offsets[0]}"
+        groups = {}
         for offset in offsets:
-            replacements[offset] = (f"    call {label}", len(body))
-        assembly.extend(["", f"{label}:"])
-        for line in body:
-            if line in OUTLINE_FAULT_BRANCHES:
-                line = line.replace("_gb_unmapped", ".Lshared_fault")
-                needs_fault_exit = True
-            assembly.append(f"    {line}")
-        assembly.append("    ret")
+            groups.setdefault(owners[offset] if section_local else None, []).append(offset)
+        for owner, locations in groups.items():
+            if (minimum - 4) * len(locations) <= minimum + 1:
+                continue
+            label = f".Lshared_{locations[0]}"
+            for offset in locations:
+                replacements[offset] = (f"    call {label}", len(body))
+            if owner is not None:
+                assembly.append(f'    .section {owner},"ax",@progbits')
+            assembly.extend(["", f"{label}:"])
+            for line in body:
+                if line in OUTLINE_FAULT_BRANCHES:
+                    line = line.replace("_gb_unmapped", ".Lshared_fault")
+                    needs_fault_exit = True
+                assembly.append(f"    {line}")
+            assembly.append("    ret")
     if needs_fault_exit:
+        if section_local:
+            assembly.append("    .section .text")
         assembly.extend(["", ".Lshared_fault:", "    pop de", "    jp _gb_unmapped"])
     result = []
     index = 0
@@ -1408,7 +1446,8 @@ def lcd_poll_rule(bank, pc, instructions, ram_code):
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
                 analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=(),
-                predict_returns=True, offload_banks=(), fallback=False, fallback_banks=()):
+                predict_returns=True, offload_banks=(), fallback=False, fallback_banks=(),
+                native_overlays=False, branch_entries=(), inline_calls=None, callback_calls=None):
     if continuous and not vblank_preview:
         raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
@@ -1416,6 +1455,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                               0xff80 <= watch_address <= 0xfffe):
         raise ValueError("watch address must be in VRAM, WRAM or HRAM")
     cartridge = Cartridge(data, ram_code)
+    if native_overlays and (fallback or fallback_banks):
+        raise ValueError("native overlays and interpreted fallback are separate build modes")
     fallback_banks = set(fallback_banks)
     if fallback_banks and (not fallback or any(not 0 <= bank <= cartridge.bank_mask for bank in fallback_banks)):
         raise ValueError("fallback banks require fallback execution and valid cartridge banks")
@@ -1432,6 +1473,10 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                                       trap_unsupported=trap_unsupported or fallback, vblank_preview=vblank_preview,
                                       dispatch_targets=dispatch_targets, input_after=input_after,
                                       analysis_limit=analysis_limit, progress=progress, merge_frames=continuous)
+    if branch_entries:
+        from control_flow import discover_branches
+        discover_branches(cartridge, branch_entries, instructions, rom_bytes, dispatch_targets,
+                          inline_calls, callback_calls=callback_calls, stop_at=stop_at)
     if fallback_banks:
         instructions = {key: value for key, value in instructions.items() if key[0] not in fallback_banks}
     if retained is not None:
@@ -1441,30 +1486,43 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     if (0, ENTRY) not in instructions:
         assembly.extend(["    .global _gb_000_0100", "_gb_000_0100:",
                          "    ld hl, 0x0100", "    jp _gb_dispatch"])
-    targets = ['#include "runtime.h"', ""]
+    targets = ['#include "runtime.h"', '#include "native_overlay.h"', ""]
     fallback_addresses = set()
     helpers = set()
     repeated = {}
     predicted_entries = set()
     predict_returns = predict_returns and bool(vblank_preview) and not timing
     ordered = sorted(instructions.items())
+    return_addresses = {
+        (bank, pc + instruction.size)
+        for (bank, pc), instruction in ordered
+        if instruction.opcode in (0xcd, *CONDITIONAL_CALL) or instruction.opcode & 0xc7 == 0xc7
+    } if native_overlays else set()
+    current_section = ".text"
     bulk_loops = {}
     bulk_backedges = {}
     if not timing:
         for (bank, pc), instruction in ordered:
             if instruction.opcode == 0x22:
                 fill = fill_loop(bank, pc, instructions, cartridge.ram_code)
-                if fill is not None:
+                if fill is not None and (not native_overlays or region_key(bank, pc) == region_key(bank, fill[2])):
                     layout, backedge, end = fill
                     bulk_loops[bank, pc] = "fill_hl", layout, end
                     bulk_backedges[bank, backedge] = pc
             if instruction.opcode == 0x2a:
                 copy = copy_loop(bank, pc, instructions, cartridge.ram_code)
-                if copy is not None:
+                if copy is not None and (not native_overlays or region_key(bank, pc) == region_key(bank, copy[2])):
                     layout, backedge, end = copy
                     bulk_loops[bank, pc] = "copy_hl_de", layout, end
                     bulk_backedges[bank, backedge] = pc
     for index, ((bank, pc), instruction) in enumerate(ordered):
+        physical_next = ordered[index + 1][0] if index + 1 < len(ordered) else None
+        if native_overlays:
+            region = region_key(bank, pc)
+            section = f".gb_native_{region:03x}" if region is not None else ".text"
+            if section != current_section:
+                assembly.append(f'    .section {section},"ax",@progbits')
+                current_section = section
         name = symbol(bank, pc)
         targets.append(f"extern void {name}(void);")
         assembly.extend(["", f"    .global _{name}", f"_{name}:"])
@@ -1479,6 +1537,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         in_ram = pc in cartridge.ram_code
         if not timing:
             wait = counter_wait(bank, pc, instruction, instructions, cartridge)
+            if native_overlays and region_key(bank, pc) != region_key(bank, pc + 3):
+                wait = []
             if wait:
                 assembly.extend(wait)
                 if not in_ram:
@@ -1517,7 +1577,8 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 mismatch = "_gb_fallback_dispatch" if fallback else "_gb_unmapped"
                 assembly.extend([f"    ld a, (_gb_hram+{pc - HRAM_BASE + index})",
                                  f"    cp a, 0x{byte:02x}", f"    jp nz, {mismatch}"])
-        native = None if timing else direct_branch(bank, pc, instruction, instructions)
+        adjacent = physical_next == (bank, pc + instruction.size)
+        native = None if timing else direct_branch(bank, pc, instruction, instructions, native_overlays, adjacent)
         if native is not None and (bank, pc) in bulk_backedges:
             start = bulk_backedges[bank, pc]
             native = [line.replace(f"_{symbol(bank, start)}", f".Lbulk_slow_{bank:03x}_{start:04x}")
@@ -1539,12 +1600,12 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             callee = None
             continuation = None
             if opcode in (0xcd, *CONDITIONAL_CALL) or opcode & 0xc7 == 0xc7:
-                target = native_destination(bank, pc, instruction.operand, instructions)
+                target = native_destination(bank, pc, instruction.operand, instructions, native_overlays)
                 if target is not None:
                     callee = f"_{symbol(*target)}"
                 if predict_returns and not in_ram:
-                    resume = native_destination(bank, pc, pc + instruction.size, instructions)
-                    if resume is not None and index + 1 < len(ordered) and ordered[index + 1][0] == resume:
+                    resume = native_destination(bank, pc, pc + instruction.size, instructions, native_overlays)
+                    if resume is not None and physical_next == resume:
                         continuation = f"_{symbol(*resume)}"
                         predicted_entries.add(continuation)
             native, size = lower_instruction(instruction.text, pc, timing=timing,
@@ -1561,18 +1622,29 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         if size is not None:
             next_pc = pc + size
             # Adjacent blocks fall through. A bank change needs a lookup.
-            if ((bank, next_pc) not in instructions or pc // BANK_SIZE != next_pc // BANK_SIZE
+            if ((bank, next_pc) != physical_next or pc // BANK_SIZE != next_pc // BANK_SIZE
+                    or (native_overlays and region_key(bank, pc) != region_key(bank, next_pc))
                     or (BANK_SIZE <= pc < 0x8000 and remaps)):
                 fallback_addresses.add(next_pc)
                 assembly.extend(f"    {line}" for line in dispatch(next_pc))
+    if native_overlays:
+        assembly.append("    .section .text")
     assembly.extend(checked_helper_stubs(helpers))
     entries = []
     entry_labels = []
     target_pages = []
+    overlay_entries = {}
     for (bank, pc), instruction in ordered:
+        region = region_key(bank, pc) if native_overlays else None
         if (dispatch_targets is not None and None not in dispatch_targets
                 and (bank, pc) not in dispatch_targets and pc not in fallback_addresses
+                and (bank, pc) not in return_addresses
+                and (region is None or region in overlay_entries)
                 and (bank, pc) != (0, ENTRY) and instruction.opcode != CHECKPOINT):
+            continue
+        entry_labels.append(f"_{symbol(bank, pc)}")
+        if region is not None:
+            overlay_entries.setdefault(region, []).append((pc, symbol(bank, pc)))
             continue
         page = (bank << 8) | (pc >> 8)
         if not target_pages or target_pages[-1][0] != page:
@@ -1580,7 +1652,6 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 raise ValueError("native target table exceeds the calculator address index")
             target_pages.append([page, len(entries), 0])
         target_pages[-1][2] += 1
-        entry_labels.append(f"_{symbol(bank, pc)}")
         entries.append(f"    {{0x{pc & 255:02x}, {symbol(bank, pc)}}},")
     if vblank_preview and not timing:
         external_entries = predicted_entries.union(entry_labels)
@@ -1588,7 +1659,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         omit_dead_flag_updates(assembly)
         reuse_native_registers(assembly, external_entries)
     if repeated:
-        assembly = outline_repeated(assembly, repeated)
+        assembly = outline_repeated(assembly, repeated, section_local=native_overlays)
     spans = []
     payload = bytearray()
     for bank, address in sorted(rom_bytes):
@@ -1629,4 +1700,21 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         f"const unsigned gb_rom_span_count = {len(data_entries)};",
         "const uint8_t gb_rom_bytes[] = {", *(payload_lines or ["    0,"]), "};",
     ])
+    if native_overlays and overlay_entries:
+        for bank, bank_entries in sorted(overlay_entries.items()):
+            targets.extend([
+                f'const GbOverlayTarget gb_native_targets_{bank:03x}[] '
+                f'__attribute__((section(".gb_native_{bank:03x}"), aligned(1))) = {{',
+                *(f"    {{0x{pc:04x}, {label}}}," for pc, label in bank_entries),
+                "};",
+            ])
+        targets.extend([
+            "const GbNativeBank gb_native_banks[] = {",
+            *(f"    {{0x{bank:03x}, gb_native_targets_{bank:03x}, {len(bank_entries)}}},"
+              for bank, bank_entries in sorted(overlay_entries.items())),
+            "};",
+            f"const unsigned gb_native_bank_count = {len(overlay_entries)};",
+            'const char gb_native_prefix[6] = "N0000";',
+            "const uint8_t gb_native_digest[32] = {0};",
+        ])
     return "\n".join(assembly) + "\n", "\n".join(targets) + "\n"

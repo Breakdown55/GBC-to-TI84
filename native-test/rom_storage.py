@@ -7,6 +7,16 @@ CHUNK_SIZE = 0x7f80
 BANK_CHUNK_SIZE = 0x4000
 
 
+def appvar(name, body):
+    if len(name) != 8 or not name.isascii() or len(body) > 0xffff - 19:
+        raise ValueError("invalid AppVar name or size")
+    variable = struct.pack("<H", len(body)) + body
+    entry = (struct.pack("<HHB", 13, len(variable), 0x15) + name.encode("ascii") +
+             b"\0\x80" + struct.pack("<H", len(variable)) + variable)
+    header = b"**TI83F*\x1a\x0a\0" + bytes(42) + struct.pack("<H", len(entry))
+    return header + entry + struct.pack("<H", sum(entry) & 0xffff)
+
+
 def cartridge_chunks(data, banks=None):
     digest = hashlib.sha256(data).digest()
     prefix = ("G" if banks is None else "B") + digest.hex()[:4].upper()
@@ -17,11 +27,7 @@ def cartridge_chunks(data, banks=None):
         payload = data[start:start + size]
         name = f"{prefix}{index:03X}"
         body = b"GBR1" + digest + struct.pack("<HH", index, len(payload)) + payload
-        variable = struct.pack("<H", len(body)) + body
-        entry = (struct.pack("<HHB", 13, len(variable), 0x15) + name.encode("ascii") +
-                 b"\0\x80" + struct.pack("<H", len(variable)) + variable)
-        header = b"**TI83F*\x1a\x0a\0" + bytes(42) + struct.pack("<H", len(entry))
-        yield name, header + entry + struct.pack("<H", sum(entry) & 0xffff)
+        yield name, appvar(name, body)
 
 
 def storage_metadata(data, banks=None):

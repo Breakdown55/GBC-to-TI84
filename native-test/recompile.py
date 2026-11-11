@@ -11,6 +11,8 @@ import tempfile
 
 from rom import DEFAULT_ANALYSIS_LIMIT, compile_rom
 from rom_storage import cartridge_chunks, storage_metadata, BANK_CHUNK_SIZE, CHUNK_SIZE
+from native_overlays import (CACHE_ADDRESS, CACHE_SIZE, FIXED_PAGE_SHIFT, BANK_PAGE_SHIFT, FIXED_REGION_BASE, RESIDENT_LIMIT,
+                             overlay_banks, linker_script, package_overlays)
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -74,9 +76,9 @@ def guard_compressed_program(run, work):
 
 
 def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, archive_size=0,
-          archive_banks=False, fallback=False):
-    def run(tool, *args):
-        subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
+          archive_banks=False, fallback=False, native_overlays=False):
+    def run(tool, *args, **options):
+        return subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True, **options)
 
     clang = "bin/ez80-clang"
     assembler = "binutils/bin/z80-none-elf-as"
@@ -88,6 +90,7 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
         )
     ]
     objects = []
+    banks = overlay_banks((work / "translated.s").read_text()) if native_overlays else []
     chunk_size = BANK_CHUNK_SIZE if archive_banks else CHUNK_SIZE
     sources = (
         ("rom_main", PROJECT / "rom_main.c"),
@@ -97,6 +100,7 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
         ("vram_dma", PROJECT / "src/vram_dma.c"),
         ("rom_storage", PROJECT / "src/rom_storage.c"),
         ("fallback", PROJECT / "src/fallback.c"),
+        ("native_overlay", PROJECT / "src/native_overlay.c"),
         ("targets", work / "targets.c"),
     )
     for unit, source in sources:
@@ -106,6 +110,10 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
             f"-DGB_LIVE={int(input_after is not None)}", f"-DGB_INPUT_AFTER={input_after or 0}", "-nostdinc",
             f"-DGB_FRAME_SKIP={frame_skip}",
             f"-DGB_FALLBACK={int(fallback)}",
+            f"-DGB_NATIVE_OVERLAYS={len(banks)}", f"-DGB_NATIVE_CACHE=0x{CACHE_ADDRESS:x}",
+            f"-DGB_NATIVE_CACHE_SIZE=0x{CACHE_SIZE:x}",
+            f"-DGB_NATIVE_FIXED_PAGE_SHIFT={FIXED_PAGE_SHIFT}", f"-DGB_NATIVE_RESIDENT_END={RESIDENT_LIMIT}",
+            f"-DGB_NATIVE_BANK_PAGE_SHIFT={BANK_PAGE_SHIFT}", f"-DGB_NATIVE_FIXED_REGION={FIXED_REGION_BASE}",
             f"-DGB_ROM_CHUNKS={(archive_size + chunk_size - 1) // chunk_size}", f"-DGB_ROM_SIZE={archive_size}",
             f"-DGB_ROM_CHUNK_SIZE={chunk_size}", f"-DGB_ARCHIVE_BANKS={int(archive_banks)}",
             "-isystem", ce / "include", "-I", PROJECT / "src",
@@ -127,10 +135,17 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
         raise ValueError("the generated program unexpectedly requires external calculator libraries")
     run(clang, "-I.", "-E", "-P", lib / "crt/crt0.S", "-o", "crt0.s")
     run(assembler, "-I.", "-march=ez80+full", "crt0.s", "-o", "crt0.o")
+    script = ce / "meta/linker_script.ld"
+    overlay_options = []
+    if banks:
+        generated = work / "native-linker.ld"
+        generated.write_text(linker_script(script.read_text(), banks))
+        script = generated
+        overlay_options = ["--no-check-sections", "--emit-relocs"]
     run(linker, "-static", "--entry=__start", "--no-warn-rwx-segments", "--gc-sections",
         "--omagic", f"--defsym=LOAD_ADDR=0x{LOAD_ADDRESS:x}", "--defsym=BSSHEAP_LOW=0xD052C6",
         "--defsym=BSSHEAP_HIGH=0xD13FD8", "--defsym=STACK_HIGH=0xD1A87E", "--defsym=__TICE__=1",
-        "-T", ce / "meta/linker_script.ld", "-Map=program.map", "program.o", "crt0.o",
+        *overlay_options, "-T", script, "-Map=program.map", "program.o", "crt0.o",
         "--start-group", lib / "libc/allocator_standard.a", *core_libs,
         "--end-group", "-o", "program.obj")
     mapping = (work / "program.map").read_text()
@@ -139,7 +154,21 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
         raise ValueError("could not determine the linked program's end address")
     if int(load_end[1], 16) > DISPLAY_RAM:
         raise ValueError("the linked program would overlap calculator display RAM")
+    if banks:
+        images = package_overlays(run, work, banks, LOAD_ADDRESS)
+        print(f"Native overlays: {len(images)} regions, {sum(size for _, size in images):,} bytes; "
+              f"largest {max(size for _, size in images):,} bytes", flush=True)
     convert_args = ("-u", "-n", name, "-j", "elf", "-i", "program.obj", "-o", "program.8xp")
+    if banks:
+        # A split launcher expands directly from Archive. Its RAM allocation
+        # includes the reusable native cache without retaining compressed input.
+        run("bin/convbin", "-k", "8xp-compressed", "-e", "zx7", "-r", "-m", "32700", *convert_args)
+        if not list(work.glob("program.8xp.*.8xv")):
+            maximum = max(512, (work / "program.8xp").stat().st_size // 2)
+            run("bin/convbin", "-k", "8xp-compressed", "-e", "zx7", "-r", "-m", str(maximum), *convert_args)
+        if not list(work.glob("program.8xp.*.8xv")):
+            raise ValueError("native overlay program requires an archived split launcher")
+        return True
     run("bin/convbin", "-k", "8xp", *convert_args)
     parts = list(work.glob("program.8xp.*.8xv"))
     if not parts:
@@ -179,6 +208,26 @@ def parse_rom_data(text):
     return tuple(int(part, 16) for part in text.split(":"))
 
 
+def parse_inline_call(text):
+    from control_flow import InlineCallFormat
+    try:
+        parts = tuple(int(part, 16) for part in text.split(":"))
+        if len(parts) not in (2, 5) or not 0 <= parts[0] < 0x8000:
+            raise ValueError("invalid inline call")
+        return parts[0], InlineCallFormat(*parts[1:])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected hexadecimal VECTOR:LENGTH[:BANK_OFFSET:INDEX_OFFSET:TABLE_BASE]"
+        ) from error
+
+
+def parse_callback_call(text):
+    match = re.fullmatch(r"([0-9a-fA-F]{1,4}):(hl|de|bc)", text)
+    if match is None:
+        raise argparse.ArgumentTypeError("expected hexadecimal ADDRESS:hl, ADDRESS:de or ADDRESS:bc")
+    return int(match[1], 16), match[2]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rom", type=Path)
@@ -191,6 +240,14 @@ def main():
                         help="execute undiscovered instructions from archived ROM until native code resumes")
     parser.add_argument("--fallback-bank", action="append", default=[], type=lambda value: int(value, 16),
                         help="execute this hexadecimal bank through fallback to reduce resident native code")
+    parser.add_argument("--native-overlays", action="store_true",
+                        help="load translated switchable banks from Archive into a reusable RAM cache")
+    parser.add_argument("--branch-entry", type=parse_entry, action="append", default=[],
+                        help="follow both direct branch outcomes from hexadecimal BANK:ADDRESS")
+    parser.add_argument("--inline-call", type=parse_inline_call, action="append", default=[],
+                        help="cartridge call format VECTOR:LENGTH[:BANK_OFFSET:INDEX_OFFSET:TABLE_BASE] in hex")
+    parser.add_argument("--callback-call", type=parse_callback_call, action="append", default=[],
+                        help="function receiving a code pointer, as hexadecimal ADDRESS:hl (or :de or :bc)")
     parser.add_argument("--stop-at", type=parse_entry,
                         help="stop before executing this hexadecimal BANK:ADDRESS")
     clock = parser.add_mutually_exclusive_group()
@@ -229,6 +286,10 @@ def main():
         parser.error("--fallback requires --archive-rom so every instruction byte is available")
     if args.fallback_bank and not args.fallback:
         parser.error("--fallback-bank requires --fallback")
+    if args.native_overlays and args.fallback:
+        parser.error("choose native overlays or interpreted fallback")
+    if (args.inline_call or args.callback_call) and not args.branch_entry:
+        parser.error("--inline-call and --callback-call configure --branch-entry discovery")
     if not re.fullmatch(r"[A-Z][A-Z0-9]{0,7}", args.name):
         parser.error("--name must start with A-Z and contain at most eight letters or digits")
     output = args.output.resolve()
@@ -255,6 +316,7 @@ def main():
     timing = args.timing or (args.live and not preview_frames)
     def progress(states, instructions, frames):
         print(f"Analysis: {states:,} states, {instructions:,} instructions, {frames} VBlanks", flush=True)
+    archive_directories = []
     try:
         cartridge_data = args.rom.read_bytes()
         archive_banks = set(args.archive_bank) if args.archive_bank else None
@@ -266,6 +328,8 @@ def main():
         backed_banks = range(len(cartridge_data) // BANK_CHUNK_SIZE) if args.archive_rom else archive_banks or set()
         if not offload_banks.issubset(backed_banks):
             raise ValueError("--offload-bank requires the same bank in --archive-bank or --archive-rom")
+        if args.native_overlays and args.archive_rom:
+            offload_banks.update(backed_banks)
         assembly, table = compile_rom(cartridge_data, args.entry, args.watch or 0, args.stop_at,
                                       timing=timing, trap_unsupported=args.trap_unsupported,
                                       ram_code=args.ram_code, vblank_preview=preview_frames,
@@ -273,7 +337,9 @@ def main():
                                       continuous=args.vblank_run,
                                       progress=progress if args.analysis_progress else None,
                                       rom_data=args.rom_data, offload_banks=offload_banks, fallback=args.fallback,
-                                      fallback_banks=args.fallback_bank)
+                                      fallback_banks=args.fallback_bank, native_overlays=args.native_overlays,
+                                      branch_entries=args.branch_entry, inline_calls=dict(args.inline_call),
+                                      callback_calls=dict(args.callback_call))
         if use_archive:
             table += storage_metadata(cartridge_data, archive_banks)
         ce = toolchain_path(args.cedev)
@@ -284,10 +350,21 @@ def main():
             (work / "targets.c").write_text(table, encoding="utf-8")
             archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after, args.frame_skip,
                              len(cartridge_data) if use_archive else 0, archive_banks is not None,
-                             fallback=args.fallback)
+                             fallback=args.fallback, native_overlays=args.native_overlays)
+            if args.native_overlays:
+                for kind, files in (("native", sorted((work / "native-data").glob("*.8xv"))),
+                                    ("parts", sorted(work.glob("program.8xp.*.8xv")))):
+                    if files:
+                        directory = output.parent / f"{args.name}-{kind}"
+                        directory.mkdir(exist_ok=True)
+                        archive_directories.append(directory)
+                        for index, path in enumerate(files):
+                            name = path.name if kind == "native" else f"{args.name[:7]}{index}.8xv"
+                            os.replace(path, directory / name)
             if use_archive:
                 directory = output.parent / f"{args.name}-data"
                 directory.mkdir(exist_ok=True)
+                archive_directories.append(directory)
                 for name, contents in cartridge_chunks(cartridge_data, archive_banks):
                     staged = work / f"{name}.8xv"
                     staged.write_bytes(contents)
@@ -298,7 +375,7 @@ def main():
         parser.exit(1, f"{error}\n")
     print(output)
     print(f"Transfer destination: {'Archive' if archived else 'RAM'}")
-    if use_archive:
+    for directory in archive_directories:
         print(f"Send every .8xv in {directory} to Archive before running.")
 
 

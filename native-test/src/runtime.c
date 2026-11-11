@@ -3,6 +3,7 @@
 #include "render.h"
 #include "timing.h"
 #include "vram_dma.h"
+#include "native_overlay.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -200,6 +201,29 @@ void gb_alu(uint8_t operation, uint8_t operand)
         gb_a = result;
     }
     gb_f = flags | (result == 0 ? GB_FLAG_Z : 0);
+}
+
+void gb_daa(void)
+{
+    uint8_t value = gb_a, correction = 0, carry = gb_f & GB_FLAG_C;
+    if (gb_f & GB_FLAG_N) {
+        if (gb_f & GB_FLAG_H) correction |= 6;
+        if (carry) correction |= 0x60;
+        value -= correction;
+    } else {
+        if ((gb_f & GB_FLAG_H) || (value & 15) > 9) correction |= 6;
+        if (carry || value > 0x99) { correction |= 0x60; carry = GB_FLAG_C; }
+        value += correction;
+    }
+    gb_a = value;
+    gb_f = (gb_f & GB_FLAG_N) | carry | (value ? 0 : GB_FLAG_Z);
+}
+
+uint8_t gb_store_sp(uint24_t address)
+{
+    uint16_t sp = gb_sp;
+    if (!gb_write_byte((uint16_t)address, sp)) return 0;
+    return gb_write_byte((uint16_t)(address + 1), sp >> 8);
 }
 
 static bool timed_register(uint8_t offset)
@@ -984,6 +1008,13 @@ GbNativeBlock gb_lookup(uint24_t address)
     }
     uint16_t bank = address >= 0x4000 && address < 0x8000 ? gb_rom_bank : 0;
     unsigned slot = (address ^ (address >> 8) ^ bank) & (LOOKUP_CACHE_SIZE - 1);
+#if GB_NATIVE_OVERLAYS
+    if (address >= GB_NATIVE_RESIDENT_END && address < 0x8000) {
+        GbNativeBlock entry = gb_native_lookup(address);
+        gb_lookup_cache[slot] = (LookupCacheEntry){(uint16_t)address, bank, entry, 0};
+        return entry;
+    }
+#endif
     uint24_t key = ((uint24_t)bank << 8) | (address >> 8);
     static const GbTargetPage *page;
     static uint24_t page_key = 0xffffff;

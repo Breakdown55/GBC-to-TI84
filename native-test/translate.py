@@ -223,6 +223,11 @@ def lower_instruction(instruction, pc=None, *, timing=False, live_immediate=Fals
                       vblank_preview=False, native_target=None, native_resume=None,
                       predict_returns=False):
     normalized = instruction.lower()
+    if normalized == "daa":
+        return ["call _gb_daa"], 1
+    stack_store = re.fullmatch(r"ld\s+\[\$([0-9a-f]{1,4})\]\s*,\s*sp", normalized)
+    if stack_store:
+        return [*call_with_arg("gb_store_sp", int(stack_store[1], 16)), *FAULT_IF_ZERO], 3
     parts = normalized.split()
     # A byte count advances the Game Boy PC. None ends the native block.
     if parts == ["nop"]:

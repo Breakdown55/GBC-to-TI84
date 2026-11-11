@@ -113,25 +113,13 @@ static void cb_instruction(uint8_t opcode)
 
 static void accumulator(unsigned operation)
 {
-    uint8_t value = gb_a, carry = 0, correction = 0;
+    uint8_t value = gb_a, carry = 0;
     switch (operation) {
     case 0: carry = value >> 7; gb_a = (value << 1) | carry; break;
     case 1: carry = value & 1; gb_a = (value >> 1) | (carry << 7); break;
     case 2: carry = value >> 7; gb_a = (value << 1) | !!(gb_f & FLAG_C); break;
     case 3: carry = value & 1; gb_a = (value >> 1) | ((gb_f & FLAG_C) << 3); break;
-    case 4:
-        carry = gb_f & FLAG_C;
-        if (gb_f & FLAG_N) {
-            if (gb_f & FLAG_H) correction |= 6;
-            if (carry) correction |= 0x60;
-            gb_a = value - correction;
-        } else {
-            if ((gb_f & FLAG_H) || (value & 15) > 9) correction |= 6;
-            if (carry || value > 0x99) { correction |= 0x60; carry = FLAG_C; }
-            gb_a = value + correction;
-        }
-        gb_f = (gb_f & FLAG_N) | carry | (gb_a ? 0 : FLAG_Z);
-        return;
+    case 4: gb_daa(); return;
     case 5: gb_a = ~value; gb_f |= FLAG_N | FLAG_H; return;
     case 6: gb_f = (gb_f & FLAG_Z) | FLAG_C; return;
     case 7: gb_f = (gb_f & FLAG_Z) | ((gb_f & FLAG_C) ^ FLAG_C); return;

@@ -3,6 +3,7 @@
 #include "show_hex.h"
 #include "timing.h"
 #include "rom_storage.h"
+#include "native_overlay.h"
 
 #ifndef GB_FRAME_SKIP
 #define GB_FRAME_SKIP 0
@@ -159,6 +160,16 @@ int main(void)
         os_PutStrFull("Archive ROM data:");
         os_NewLine();
         os_PutStrFull(gb_archive_name);
+        while (!os_GetCSC()) {}
+        return 1;
+    }
+#endif
+#if GB_NATIVE_OVERLAYS
+    if (!gb_native_init()) {
+        os_ClrHome();
+        os_PutStrFull("Archive native code:");
+        os_NewLine();
+        os_PutStrFull(gb_native_archive_name);
         while (!os_GetCSC()) {}
         return 1;
     }

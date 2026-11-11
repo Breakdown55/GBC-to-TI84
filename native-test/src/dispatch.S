@@ -308,6 +308,21 @@ _gb_fallback_dispatch:
 .Lreturn_cache:
     .space 128
 
+    .section .text.gb_native_cache_reset
+    .global _gb_native_cache_reset
+_gb_native_cache_reset:
+    ld hl, _gb_lookup_cache
+    ld de, _gb_lookup_cache+1
+    ld (hl), 0
+    ld bc, 255
+    ldir
+    ld hl, .Lreturn_cache
+    ld de, .Lreturn_cache+1
+    ld (hl), 0
+    ld bc, 127
+    ldir
+    ret
+
     .section .text.gb_return_prediction
     .global _gb_call_predict
     .global _gb_call_predict_native

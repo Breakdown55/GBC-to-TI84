@@ -75,7 +75,7 @@ class FallbackTest(unittest.TestCase):
 
     def test_compiler_routes_unsupported_native_opcodes_to_fallback(self):
         data = bytearray(2 * BANK_SIZE)
-        data[0x100] = 0x27  # DAA is implemented by fallback.
+        data[0x100] = 0xd3  # An invalid opcode is reported by the fallback executor.
         assembly, table = compile_rom(data, fallback=True)
         self.assertIn("jp _gb_fallback_dispatch", assembly)
         self.assertIn("rom_preview_mode = 0", table)
