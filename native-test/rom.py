@@ -1447,7 +1447,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
                 analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=(),
                 predict_returns=True, offload_banks=(), fallback=False, fallback_banks=(),
-                native_overlays=False, branch_entries=(), inline_calls=None, callback_calls=None):
+                native_overlays=False, branch_entries=(), inline_calls=None, callback_calls=None, entry_tables=()):
     if continuous and not vblank_preview:
         raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
@@ -1473,8 +1473,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                                       trap_unsupported=trap_unsupported or fallback, vblank_preview=vblank_preview,
                                       dispatch_targets=dispatch_targets, input_after=input_after,
                                       analysis_limit=analysis_limit, progress=progress, merge_frames=continuous)
-    if branch_entries:
-        from control_flow import discover_branches
+    if branch_entries or entry_tables:
+        from control_flow import discover_branches, read_entry_tables
+        branch_entries = (*branch_entries, *read_entry_tables(cartridge, entry_tables, rom_bytes))
         discover_branches(cartridge, branch_entries, instructions, rom_bytes, dispatch_targets,
                           inline_calls, callback_calls=callback_calls, stop_at=stop_at)
     if fallback_banks:

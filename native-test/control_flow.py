@@ -76,6 +76,25 @@ def inline_jump_table(cartridge, bank, vector, start):
     return targets
 
 
+def read_entry_tables(cartridge, tables, rom_bytes):
+    """Resolve declared little-endian word tables within a ROM window."""
+    entries = []
+    for bank, start, count in tables:
+        end = start + 2 * count
+        if (not 0 <= bank <= cartridge.bank_mask or not 0 <= start < end <= 0x8000
+                or start // BANK_SIZE != (end - 1) // BANK_SIZE):
+            raise ValueError("entry table must fit in one cartridge ROM window")
+        source_bank = bank if start >= BANK_SIZE else 0
+        for pc in range(start, end, 2):
+            offset = source_bank * BANK_SIZE + pc % BANK_SIZE
+            target = int.from_bytes(cartridge.data[offset:offset + 2], "little")
+            if target >= 0x8000 and target not in cartridge.ram_code:
+                raise ValueError(f"entry table {bank:03X}:{pc:04X} points outside translated memory")
+            entries.append((bank, target))
+        rom_bytes.update((source_bank, pc) for pc in range(start, end))
+    return entries
+
+
 def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targets,
                       inline_calls=None, *, callback_calls=None, limit=100000, stop_at=None):
     """Add both outcomes of branches and the continuations of calls.

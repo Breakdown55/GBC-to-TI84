@@ -244,6 +244,8 @@ def main():
                         help="load translated switchable banks from Archive into a reusable RAM cache")
     parser.add_argument("--branch-entry", type=parse_entry, action="append", default=[],
                         help="follow both direct branch outcomes from hexadecimal BANK:ADDRESS")
+    parser.add_argument("--entry-table", type=parse_rom_data, action="append", default=[],
+                        help="follow a table of 16-bit code pointers, hexadecimal BANK:ADDRESS:COUNT")
     parser.add_argument("--inline-call", type=parse_inline_call, action="append", default=[],
                         help="cartridge call format VECTOR:LENGTH[:BANK_OFFSET:INDEX_OFFSET:TABLE_BASE] in hex")
     parser.add_argument("--callback-call", type=parse_callback_call, action="append", default=[],
@@ -288,8 +290,8 @@ def main():
         parser.error("--fallback-bank requires --fallback")
     if args.native_overlays and args.fallback:
         parser.error("choose native overlays or interpreted fallback")
-    if (args.inline_call or args.callback_call) and not args.branch_entry:
-        parser.error("--inline-call and --callback-call configure --branch-entry discovery")
+    if (args.inline_call or args.callback_call) and not (args.branch_entry or args.entry_table):
+        parser.error("--inline-call and --callback-call configure --branch-entry or --entry-table discovery")
     if not re.fullmatch(r"[A-Z][A-Z0-9]{0,7}", args.name):
         parser.error("--name must start with A-Z and contain at most eight letters or digits")
     output = args.output.resolve()
@@ -339,7 +341,7 @@ def main():
                                       rom_data=args.rom_data, offload_banks=offload_banks, fallback=args.fallback,
                                       fallback_banks=args.fallback_bank, native_overlays=args.native_overlays,
                                       branch_entries=args.branch_entry, inline_calls=dict(args.inline_call),
-                                      callback_calls=dict(args.callback_call))
+                                      callback_calls=dict(args.callback_call), entry_tables=args.entry_table)
         if use_archive:
             table += storage_metadata(cartridge_data, archive_banks)
         ce = toolchain_path(args.cedev)

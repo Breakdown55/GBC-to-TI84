@@ -1,6 +1,6 @@
 import unittest
 
-from control_flow import InlineCallFormat, discover_branches
+from control_flow import InlineCallFormat, discover_branches, read_entry_tables
 from rom import BANK_SIZE, Cartridge, compile_rom
 from translate import lower_instruction
 
@@ -14,6 +14,23 @@ def cartridge():
 
 
 class BranchDiscoveryTest(unittest.TestCase):
+    def test_banked_entry_table_keeps_data_and_follows_every_pointer(self):
+        data = cartridge()
+        for bank in (1, 3):
+            base = bank * BANK_SIZE
+            data[base:base + 4] = bytes.fromhex("10 40 20 40")
+            data[base + 0x10:base + 0x14] = bytes.fromhex("c3 30 40 00")
+            data[base + 0x20] = data[base + 0x30] = 0xc9
+            assembly, _ = compile_rom(data, entry_tables=[(bank, 0x4000, 2)])
+            self.assertIn(f"_gb_{bank:03x}_4020:", assembly)
+            self.assertIn(f"_gb_{bank:03x}_4030:", assembly)
+            self.assertNotIn(f"_gb_{bank:03x}_4000:", assembly)
+            rom_bytes = set()
+            read_entry_tables(Cartridge(data), [(bank, 0x4000, 2)], rom_bytes)
+            self.assertEqual(rom_bytes, {(bank, pc) for pc in range(0x4000, 0x4004)})
+        with self.assertRaisesRegex(ValueError, "one cartridge ROM window"):
+            read_entry_tables(Cartridge(data), [(1, 0x7fff, 1)], set())
+
     def test_both_branch_arms_are_native_entries(self):
         data = cartridge()
         data[0x4000:0x400c] = bytes.fromhex("3e 00 fe 00 28 03 3e a5 c9 3e 5a c9")
