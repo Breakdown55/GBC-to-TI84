@@ -52,7 +52,8 @@ uint8_t gb_wram_banks[7][GB_WRAM_SIZE];
 uint8_t *gb_wram_pages[2] = {gb_wram, gb_wram_banks[0]};
 /* Native reads can reuse the most recent contiguous ROM span. */
 struct {
-    uint24_t start, length, bias;
+    uint24_t start, length;
+    uintptr_t bias;
 } gb_rom_read_cache;
 uint8_t gb_hram[GB_HRAM_SIZE];
 uint8_t gb_lcdc;
@@ -582,16 +583,13 @@ static const GbRomSpan *find_rom_span(uint16_t address)
     }
 #if GB_ROM_CHUNKS
     /* Cache the archive gap without replacing faster embedded bytes. */
-    uint16_t start = address & 0x4000, end = start + 0x4000;
-    if (first && gb_rom_data[first - 1].bank == bank) {
-        const GbRomSpan *previous = &gb_rom_data[first - 1];
-        start = previous->address + previous->length;
-    }
+    uint16_t end = (address & 0x4000) + 0x4000;
     if (first < gb_rom_data_count && gb_rom_data[first].bank == bank) {
         end = gb_rom_data[first].address;
     }
-    const uint8_t *bytes = gb_archive_pointer(start, end - start);
-    if (bytes) cache_rom_read(start, end - start, bytes);
+    unsigned length = end - address;
+    const uint8_t *bytes = gb_archive_window(address, &length);
+    if (bytes) cache_rom_read(address, length, bytes);
 #endif
     return 0;
 }
@@ -696,6 +694,9 @@ static uint8_t write_sram(uint24_t address, uint8_t value)
 static uint16_t read_memory(uint24_t address)
 {
     if (address < 0x8000) {
+        if ((uint16_t)(address - gb_rom_read_cache.start) < gb_rom_read_cache.length) {
+            return *(const uint8_t *)(gb_rom_read_cache.bias + address);
+        }
         const GbRomSpan *span = find_rom_span((uint16_t)address);
 #if GB_ROM_CHUNKS
         if (!span) return gb_archive_read((uint16_t)address);
@@ -985,16 +986,19 @@ GbNativeBlock gb_lookup(uint24_t address)
     unsigned slot = (address ^ (address >> 8) ^ bank) & (LOOKUP_CACHE_SIZE - 1);
     uint24_t key = ((uint24_t)bank << 8) | (address >> 8);
     static const GbTargetPage *page;
-    if (!page || page->key != key) {
+    static uint24_t page_key = 0xffffff;
+    if (page_key != key) {
         unsigned first = 0, last = gb_target_page_count;
         while (first < last) {
             unsigned middle = first + (last - first) / 2;
             if (gb_target_pages[middle].key < key) first = middle + 1;
             else last = middle;
         }
-        if (first == gb_target_page_count || gb_target_pages[first].key != key) return 0;
-        page = &gb_target_pages[first];
+        page_key = key;
+        page = first < gb_target_page_count && gb_target_pages[first].key == key
+             ? &gb_target_pages[first] : 0;
     }
+    if (!page) return 0;
     GbNativeBlock entry = lookup_address(page, (uint8_t)address);
     gb_lookup_cache[slot] = (LookupCacheEntry){(uint16_t)address, bank, entry, 0};
     return entry;

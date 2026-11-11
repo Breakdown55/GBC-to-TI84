@@ -1408,7 +1408,7 @@ def lcd_poll_rule(bank, pc, instructions, ram_code):
 def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing=False,
                 trap_unsupported=False, ram_code=(), vblank_preview=False, input_after=None,
                 analysis_limit=DEFAULT_ANALYSIS_LIMIT, continuous=False, progress=None, rom_data=(),
-                predict_returns=True, offload_banks=()):
+                predict_returns=True, offload_banks=(), fallback=False, fallback_banks=()):
     if continuous and not vblank_preview:
         raise ValueError("continuous VBlank execution requires a positive analysis frame count")
     if watch_address and not (0x8000 <= watch_address < 0xa000 or
@@ -1416,6 +1416,9 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
                               0xff80 <= watch_address <= 0xfffe):
         raise ValueError("watch address must be in VRAM, WRAM or HRAM")
     cartridge = Cartridge(data, ram_code)
+    fallback_banks = set(fallback_banks)
+    if fallback_banks and (not fallback or any(not 0 <= bank <= cartridge.bank_mask for bank in fallback_banks)):
+        raise ValueError("fallback banks require fallback execution and valid cartridge banks")
     rom_bytes = set()
     for bank, address, length in rom_data:
         if (not 0 <= bank <= cartridge.bank_mask or not 0 <= address < 2 * BANK_SIZE
@@ -1426,13 +1429,18 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
     dispatch_targets = set() if vblank_preview else None
     retained = rom_bytes.copy() if offload_banks else None
     instructions = cartridge.discover(extra_entries, stop_at, rom_bytes, timing=timing,
-                                      trap_unsupported=trap_unsupported, vblank_preview=vblank_preview,
+                                      trap_unsupported=trap_unsupported or fallback, vblank_preview=vblank_preview,
                                       dispatch_targets=dispatch_targets, input_after=input_after,
                                       analysis_limit=analysis_limit, progress=progress, merge_frames=continuous)
+    if fallback_banks:
+        instructions = {key: value for key, value in instructions.items() if key[0] not in fallback_banks}
     if retained is not None:
         retained.update(location for location in rom_bytes if location[0] not in offload_banks)
         rom_bytes = retained
     assembly = ["    .assume ADL=1", "    .section .text"]
+    if (0, ENTRY) not in instructions:
+        assembly.extend(["    .global _gb_000_0100", "_gb_000_0100:",
+                         "    ld hl, 0x0100", "    jp _gb_dispatch"])
     targets = ['#include "runtime.h"', ""]
     fallback_addresses = set()
     helpers = set()
@@ -1499,15 +1507,16 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
             assembly.append("    jp _gb_checkpoint")
             continue
         if opcode == UNSUPPORTED:
-            assembly.append("    jp _gb_unmapped")
+            assembly.append("    jp _gb_fallback_dispatch" if fallback else "    jp _gb_unmapped")
             continue
         live_immediate = in_ram and opcode in IMMEDIATE_LOADS
         if in_ram:
             image, offset, _ = cartridge.instruction_bytes(bank, pc)
             guard_size = 1 if live_immediate else instruction.size
             for index, byte in enumerate(image[offset:offset + guard_size]):
+                mismatch = "_gb_fallback_dispatch" if fallback else "_gb_unmapped"
                 assembly.extend([f"    ld a, (_gb_hram+{pc - HRAM_BASE + index})",
-                                 f"    cp a, 0x{byte:02x}", "    jp nz, _gb_unmapped"])
+                                 f"    cp a, 0x{byte:02x}", f"    jp nz, {mismatch}"])
         native = None if timing else direct_branch(bank, pc, instruction, instructions)
         if native is not None and (bank, pc) in bulk_backedges:
             start = bulk_backedges[bank, pc]
@@ -1613,6 +1622,7 @@ def compile_rom(data, extra_entries=(), watch_address=0, stop_at=None, *, timing
         f"const uint8_t rom_mbc5 = {int(cartridge.mbc5)};",
         f"const uint8_t rom_cgb = {int(cartridge.cgb)};",
         f"const uint8_t rom_timing = {int(timing)};",
+        f"const uint8_t rom_preview_mode = {int(bool(vblank_preview))};",
         f"const unsigned rom_preview_frames = {0 if continuous else int(vblank_preview)};",
         f"const uint8_t rom_ram_size_code = {data[0x149]};",
         "", "const GbRomSpan gb_rom_spans[] = {", *(data_entries or ["    {0, 0, 0, 0},"]), "};",

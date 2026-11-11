@@ -292,7 +292,15 @@ _gb_dispatch:
     ld de, 0
     or a, a
     sbc hl, de
-    jp z, _gb_missing_target
+    jr nz, .Lnative_target_found
+    .global _gb_fallback_dispatch
+_gb_fallback_dispatch:
+    call _gb_fallback_run
+    ld de, 0
+    or a, a
+    sbc hl, de
+    ret z
+.Lnative_target_found:
     jp (hl)
 
     .section .bss.gb_return_cache,"aw",@nobits

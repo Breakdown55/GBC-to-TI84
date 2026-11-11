@@ -74,7 +74,7 @@ def guard_compressed_program(run, work):
 
 
 def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, archive_size=0,
-          archive_banks=False):
+          archive_banks=False, fallback=False):
     def run(tool, *args):
         subprocess.run([ce / f"{tool}{EXECUTABLE}", *args], cwd=work, check=True)
 
@@ -96,6 +96,7 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
         ("render", PROJECT / "src/render.c"),
         ("vram_dma", PROJECT / "src/vram_dma.c"),
         ("rom_storage", PROJECT / "src/rom_storage.c"),
+        ("fallback", PROJECT / "src/fallback.c"),
         ("targets", work / "targets.c"),
     )
     for unit, source in sources:
@@ -104,6 +105,7 @@ def build(ce, work, name, show_frame=False, input_after=None, frame_skip=0, arch
             "-D__TICE__=1", f"-DGB_SHOW_FRAME={int(show_frame)}",
             f"-DGB_LIVE={int(input_after is not None)}", f"-DGB_INPUT_AFTER={input_after or 0}", "-nostdinc",
             f"-DGB_FRAME_SKIP={frame_skip}",
+            f"-DGB_FALLBACK={int(fallback)}",
             f"-DGB_ROM_CHUNKS={(archive_size + chunk_size - 1) // chunk_size}", f"-DGB_ROM_SIZE={archive_size}",
             f"-DGB_ROM_CHUNK_SIZE={chunk_size}", f"-DGB_ARCHIVE_BANKS={int(archive_banks)}",
             "-isystem", ce / "include", "-I", PROJECT / "src",
@@ -185,6 +187,10 @@ def main():
     parser.add_argument("--name", default="GBCRUN", help="calculator program name")
     parser.add_argument("--entry", type=parse_seed, action="append", default=[],
                         help="additional hexadecimal BANK:ADDRESS[:SP] entry for dynamic targets")
+    parser.add_argument("--fallback", action="store_true",
+                        help="execute undiscovered instructions from archived ROM until native code resumes")
+    parser.add_argument("--fallback-bank", action="append", default=[], type=lambda value: int(value, 16),
+                        help="execute this hexadecimal bank through fallback to reduce resident native code")
     parser.add_argument("--stop-at", type=parse_entry,
                         help="stop before executing this hexadecimal BANK:ADDRESS")
     clock = parser.add_mutually_exclusive_group()
@@ -219,6 +225,10 @@ def main():
     parser.add_argument("--watch", type=lambda value: int(value, 16), default=None,
                         help="hexadecimal VRAM, WRAM, or HRAM address to display after execution")
     args = parser.parse_args()
+    if args.fallback and not args.archive_rom:
+        parser.error("--fallback requires --archive-rom so every instruction byte is available")
+    if args.fallback_bank and not args.fallback:
+        parser.error("--fallback-bank requires --fallback")
     if not re.fullmatch(r"[A-Z][A-Z0-9]{0,7}", args.name):
         parser.error("--name must start with A-Z and contain at most eight letters or digits")
     output = args.output.resolve()
@@ -262,7 +272,8 @@ def main():
                                       input_after=input_after, analysis_limit=args.analysis_limit,
                                       continuous=args.vblank_run,
                                       progress=progress if args.analysis_progress else None,
-                                      rom_data=args.rom_data, offload_banks=offload_banks)
+                                      rom_data=args.rom_data, offload_banks=offload_banks, fallback=args.fallback,
+                                      fallback_banks=args.fallback_bank)
         if use_archive:
             table += storage_metadata(cartridge_data, archive_banks)
         ce = toolchain_path(args.cedev)
@@ -272,7 +283,8 @@ def main():
             (work / "translated.s").write_text(assembly, encoding="utf-8")
             (work / "targets.c").write_text(table, encoding="utf-8")
             archived = build(ce, work, args.name, args.frame or bool(preview_frames), input_after, args.frame_skip,
-                             len(cartridge_data) if use_archive else 0, archive_banks is not None)
+                             len(cartridge_data) if use_archive else 0, archive_banks is not None,
+                             fallback=args.fallback)
             if use_archive:
                 directory = output.parent / f"{args.name}-data"
                 directory.mkdir(exist_ok=True)

@@ -42,11 +42,21 @@ int main(void)
     assert(!gb_archive_pointer(0x4000, 0x4000)); /* Chunk boundary within bank 3. */
     assert(!gb_archive_pointer(0x3fff, 2));
     assert(!gb_archive_pointer(0x7fff, 2));
+    unsigned length = 0x4000;
+    const uint8_t *window = gb_archive_window(0x4000, &length);
+    assert(window && length == 2 * GB_ROM_CHUNK_SIZE - 3 * 0x4000);
+    assert(window[length - 1] == 3);
+    length = 0x4000;
+    window = gb_archive_window(0x7fff, &length);
+    assert(window && length == 1 && *window == 3);
     gb_rom_bank = 0;
     assert(gb_archive_read(0x4000) == 0);
     gb_rom_bank = 4;
     assert(gb_archive_read(0x4fff) == 4);
     assert(gb_archive_read(0x5000) == GB_UNMAPPED_BYTE);
+    length = 0x4000;
+    window = gb_archive_window(0x4fff, &length);
+    assert(window && length == 1 && *window == 4);
     gb_rom_bank = 6;
     assert(gb_archive_read(0x4000) == GB_UNMAPPED_BYTE);
     absent = 1;
