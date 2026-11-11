@@ -95,6 +95,32 @@ def read_entry_tables(cartridge, tables, rom_bytes):
     return entries
 
 
+def tail_return(instructions, bank, pc):
+    """Find a continuation pushed before a tail jump instead of a CALL."""
+    load = instructions.get((bank, pc))
+    pushes = {0x01: 0xc5, 0x11: 0xd5, 0x21: 0xe5}
+    if load is None or load.opcode not in pushes:
+        return None
+    pc += load.size
+    push = instructions.get((bank, pc))
+    if push is None or push.opcode != pushes[load.opcode]:
+        return None
+    pc += push.size
+    for _ in range(8):
+        instruction = instructions.get((bank, pc))
+        if instruction is None:
+            return None
+        pc += instruction.size
+        if instruction.opcode in (0x18, 0xc3):
+            return pc if load.operand == pc else None
+        if instruction.opcode in (0x33, 0x3b, 0xe8, 0xf9):
+            return None
+        if not (instruction.register_only() or instruction.opcode in (
+                *CONDITIONAL_JR, *CONDITIONAL_JP, 0xfa, 0xf0)):
+            return None
+    return None
+
+
 def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targets,
                       inline_calls=None, *, callback_calls=None, limit=100000, stop_at=None):
     """Add both outcomes of branches and the continuations of calls.
@@ -107,12 +133,14 @@ def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targ
     callback_calls = callback_calls or {}
     entries = tuple(entries)
     explicit = {(bank if BANK_SIZE <= pc < 0x8000 else 0, pc) for bank, pc in entries}
+    continuations = {(bank, target) for bank, pc in instructions
+                     if bank and (target := tail_return(instructions, bank, pc)) is not None}
     occupied = {}
     for (bank, pc), instruction in sorted(instructions.items()):
         for byte in range(pc, pc + instruction.size):
             occupied.setdefault((bank, byte), pc)
     unknown = (None,) * 7  # A, B, C, D, E, H, L.
-    pending = deque((bank, pc, True, unknown) for bank, pc in entries)
+    pending = deque((bank, pc, True, unknown) for bank, pc in (*entries, *sorted(continuations)))
     visited = set()
     outside = set()
     tables = {}
@@ -195,6 +223,9 @@ def discover_branches(cartridge, entries, instructions, rom_bytes, dispatch_targ
                 pending.append((bank, following, True, unknown))
         elif opcode in (0x18, 0xc3):
             pending.append((bank, instruction.operand, True, unknown))
+            if any(tail_return(instructions, key[0], start) == following
+                   for start in range(max(0, pc - 28), pc - 3)):
+                pending.append((bank, following, True, unknown))
         elif opcode in (*CONDITIONAL_JR, *CONDITIONAL_JP) or call:
             pending.append((bank, instruction.operand, True, unknown))
             pending.append((bank, following, True, unknown))

@@ -14,6 +14,20 @@ def cartridge():
 
 
 class BranchDiscoveryTest(unittest.TestCase):
+    def test_tail_dispatch_with_pushed_return_address_keeps_continuation(self):
+        data = cartridge()
+        data[0x4000:0x400e] = bytes.fromhex("21 0d 40 e5 fa 00 c0 b7 c2 20 40 18 13 c9")
+        cart = Cartridge(data)
+        instructions = {(1, pc): cart.decode(1, pc) for pc in (0x4000, 0x4003, 0x4004, 0x4007, 0x4008, 0x400b)}
+        targets = set()
+        discover_branches(cart, [], instructions, set(), targets)
+        self.assertIn((1, 0x400d), instructions)
+        self.assertIn((1, 0x400d), targets)
+        instructions, targets = {}, set()
+        discover_branches(cart, [(1, 0x4000)], instructions, set(), targets)
+        self.assertIn((1, 0x400d), instructions)
+        self.assertIn((1, 0x400d), targets)
+
     def test_banked_entry_table_keeps_data_and_follows_every_pointer(self):
         data = cartridge()
         for bank in (1, 3):
